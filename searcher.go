@@ -132,11 +132,11 @@ func (ix *Index) Search(query string, k int) ([]SearchResult, error) {
 			continue
 		}
 		seen[c.globalI] = struct{}{}
-		url, title, err := ix.segs[c.seg].storedFields(c.dense)
+		f, err := ix.segs[c.seg].storedFields(c.dense)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SearchResult{Doc: c.dense, URL: url, Title: title, Score: c.score})
+		out = append(out, SearchResult{Doc: c.dense, DocID: c.globalI, URL: f.url, Title: f.title, Snippet: f.snippet, Score: c.score})
 		if len(out) == k {
 			break
 		}
