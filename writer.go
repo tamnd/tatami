@@ -52,20 +52,21 @@ func (o *WriterOptions) withDefaults() {
 // io.WriterAt, buffering at most one row group in memory, and patches the fixed
 // header at the end once the footer offset and row count are known.
 type Writer struct {
-	w        io.WriterAt
-	pos      int64
-	schema   *Schema
-	opts     WriterOptions
-	blockc   codec.Codec
-	builders []*columnBuilder
-	blobCols []*blobColAccum
-	meta     fileMeta
-	rowCount uint64
-	bufRows  int
-	bufBytes int
-	kv       []kvPair
-	closed   bool
-	err      error
+	w             io.WriterAt
+	pos           int64
+	schema        *Schema
+	opts          WriterOptions
+	blockc        codec.Codec
+	builders      []*columnBuilder
+	blobCols      []*blobColAccum
+	pendingBlooms [][]byte
+	meta          fileMeta
+	rowCount      uint64
+	bufRows       int
+	bufBytes      int
+	kv            []kvPair
+	closed        bool
+	err           error
 }
 
 // NewWriter creates a Writer over an io.WriterAt (an *os.File is the common
@@ -175,20 +176,39 @@ func (w *Writer) flushGroup() error {
 	}
 	g := rowGroupMeta{firstRow: w.rowCount, numRows: w.bufRows}
 	groupStart := w.pos
+	sortIdx, hasSort := w.schema.sortKeyIndex()
 	for i := range w.builders {
+		col := w.builders[i].column()
 		var cm chunkMeta
 		var err error
 		if w.blobCols[i] != nil {
-			cm, err = w.writeBlobRefChunk(i, w.builders[i].column())
+			cm, err = w.writeBlobRefChunk(i, col)
 		} else {
-			cm, err = w.writeChunk(i, w.builders[i].column())
+			cm, err = w.writeChunk(i, col)
 		}
 		if err != nil {
 			return err
 		}
+		// Build a membership filter for an opted-in, non-blob column. The sort key
+		// needs none: the sparse key index answers membership exactly.
+		f := w.schema.Fields[i]
+		isSortCol := hasSort && sortIdx == i
+		if f.BloomFilter && w.blobCols[i] == nil && !isSortCol {
+			cm.bloomRef = w.buildGroupBloom(f.Type, col)
+		}
 		g.chunks = append(g.chunks, cm)
 		w.meta.uncompressedTotal += uint64(cm.totalUncompressed)
 		w.meta.compressedTotal += uint64(cm.totalCompressed)
+	}
+	if hasSort {
+		for _, cm := range g.chunks {
+			if cm.columnID == sortIdx && cm.zone.present {
+				g.sortKeyMin = cm.zone.min
+				g.sortKeyMax = cm.zone.max
+				g.hasSortBounds = true
+				break
+			}
+		}
 	}
 	g.totalBytes = w.pos - groupStart
 	w.meta.groups = append(w.meta.groups, g)
@@ -215,6 +235,12 @@ func (w *Writer) writeChunk(colID int, col Column) (chunkMeta, error) {
 		encoding:        EncPlain,
 		codec:           Codec(w.blockc.ID()),
 	}
+	sortCol := false
+	if si, ok := w.schema.sortKeyIndex(); ok && si == colID {
+		sortCol = true
+	}
+	var pages []pageEntry
+	var chunkZone zoneStat
 	step := w.opts.PageMaxValues
 	for s := 0; s < n; s += step {
 		cnt := step
@@ -239,6 +265,7 @@ func (w *Writer) writeChunk(colID int, col Column) (chunkMeta, error) {
 		if s == 0 {
 			cm.encoding = enc
 		}
+		pageStart := w.pos
 		ph := pageHeader{
 			kind:             PageData,
 			encoding:         enc,
@@ -257,10 +284,24 @@ func (w *Writer) writeChunk(colID int, col Column) (chunkMeta, error) {
 		if err := w.write(compressed); err != nil {
 			return cm, err
 		}
+		pz := columnZone(f.Type, col, s, cnt)
+		chunkZone = chunkZone.merge(f.Type, pz)
+		pages = append(pages, pageEntry{firstRow: s, firstPageOffset: pageStart, zone: pz})
 		cm.totalCompressed += int64(len(compressed))
 		cm.totalUncompressed += int64(uncompressed)
 		cm.nullCount += nullCount
 		cm.numPages++
+	}
+	cm.zone = chunkZone
+	// The sort column carries a per-page index so a point or range lookup binary
+	// searches to one page. Other columns rely on the chunk-level zone map for
+	// group pruning and do not pay for a page index.
+	if sortCol {
+		off, err := w.writeIndexRecord(PageIdx, encodePageIndex(pages))
+		if err != nil {
+			return cm, err
+		}
+		cm.pageIndexOffset = off
 	}
 	return cm, nil
 }
@@ -275,6 +316,9 @@ func (w *Writer) flags() uint16 {
 	}
 	if len(w.meta.dicts) > 0 {
 		fl |= FlagHasDictRegion
+	}
+	if len(w.meta.blooms) > 0 {
+		fl |= FlagHasIndexRegion
 	}
 	return fl
 }
@@ -293,6 +337,9 @@ func (w *Writer) Close() error {
 		return err
 	}
 	if err := w.writeBlobRegions(); err != nil {
+		return err
+	}
+	if err := w.writeIndexRegion(); err != nil {
 		return err
 	}
 

@@ -49,6 +49,15 @@ func newInspectCmd() *cobra.Command {
 					fmt.Fprintf(&b, "  %-20s   blob region: %d->%d bytes in %d runs%s\n",
 						"", c.BlobUncompressed, c.BlobCompressed, c.BlobRuns, dict)
 				}
+				if idx := indexTags(c); idx != "" {
+					fmt.Fprintf(&b, "  %-20s   index: %s\n", "", idx)
+				}
+			}
+			if info.Sorted {
+				fmt.Fprintf(&b, "sorted:  by %s (sparse primary-key index)\n", info.SortColumn)
+			}
+			if info.NumBlooms > 0 {
+				fmt.Fprintf(&b, "blooms:  %d membership filters\n", info.NumBlooms)
 			}
 			if info.NumDicts > 0 {
 				fmt.Fprintf(&b, "dicts:   %d (%d uncompressed bytes)\n", info.NumDicts, info.DictUncompressed)
@@ -63,6 +72,24 @@ func newInspectCmd() *cobra.Command {
 			return err
 		},
 	}
+}
+
+// indexTags renders the per-column index structures as a short comma list.
+func indexTags(c tatami.ColumnStat) string {
+	var tags []string
+	if c.HasZone {
+		tags = append(tags, "zone-map")
+	}
+	if c.HasPageIndex {
+		tags = append(tags, "page-index")
+	}
+	if c.HasBloom {
+		tags = append(tags, "bloom")
+	}
+	if c.IsSortKey {
+		tags = append(tags, "sort-key")
+	}
+	return strings.Join(tags, ", ")
 }
 
 func roleName(searchSeg bool) string {

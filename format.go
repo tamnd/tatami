@@ -25,7 +25,7 @@ const Magic = "TAT1"
 // tolerate for the parts they understand.
 const (
 	VersionMajor uint16 = 1
-	VersionMinor uint16 = 0
+	VersionMinor uint16 = 1
 )
 
 // HeaderSize is the fixed size of the file header in bytes.

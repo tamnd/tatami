@@ -8,6 +8,7 @@ const (
 	fieldFlagSortKey  uint8 = 1 << 1
 	fieldFlagBlobSep  uint8 = 1 << 2
 	fieldFlagDictHint uint8 = 1 << 3
+	fieldFlagBloom    uint8 = 1 << 4
 )
 
 // Field describes one column: its name, logical type, and how it is treated.
@@ -28,6 +29,12 @@ type Field struct {
 	// DictHint asks the sampler to prefer dictionary encoding for this column
 	// (M1 on). M0 ignores it.
 	DictHint bool
+	// BloomFilter asks the writer to build a membership filter over this column
+	// per row group (M3 on), so an equality probe skips groups that cannot hold
+	// the value. It is the opt-in for the point-lookup columns (doc_id, url,
+	// digest in the document-store role). A sort-key column needs none, since the
+	// sparse key index answers membership exactly.
+	BloomFilter bool
 	// Element is the element type for a LIST column, otherwise zero.
 	Element LogicalType
 }
@@ -46,6 +53,9 @@ func (f Field) flags() uint8 {
 	if f.DictHint {
 		fl |= fieldFlagDictHint
 	}
+	if f.BloomFilter {
+		fl |= fieldFlagBloom
+	}
 	return fl
 }
 
@@ -55,6 +65,7 @@ func fieldFromFlags(fl uint8) Field {
 		SortKey:       fl&fieldFlagSortKey != 0,
 		BlobSeparated: fl&fieldFlagBlobSep != 0,
 		DictHint:      fl&fieldFlagDictHint != 0,
+		BloomFilter:   fl&fieldFlagBloom != 0,
 	}
 }
 

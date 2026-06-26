@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M3 indexing. The file now carries the pruning structures a selective read
+  needs so its cost tracks the size of the answer, not the size of the data.
+  Every column chunk records a min/max zone map, so a predicate scan skips whole
+  row groups whose range cannot hold the value. Opt-in columns carry a per-group
+  bloom membership filter (a new self-contained `index/` subpackage), so an
+  equality probe on an unsorted column skips the groups the filter rules out. A
+  sorted file carries a sparse primary-key index: the coarse per-group key bounds
+  plus a per-page index on the sort column, so a point lookup descends to one
+  page in a bounded number of seeks. The reader gained `Scan(pred, projection)`
+  with a three-valued pushdown evaluator and `Lookup(key)` for the bounded-seek
+  point read. The footer gained the zone, bloom-reference, page-index, and
+  sort-bound fields, all flag-gated so an older chunk decodes unchanged, plus an
+  index-region descriptor section; the header gained the index-region flag and
+  the format minor version moved to 1.1. `inspect` reports each column's index
+  structures and the sort key.
 - M2 blob region and shared dictionaries. BLOBREF columns are separated out of
   the row groups into a trailing blob region of packed runs, so a large body
   compresses against the whole file instead of one page at a time. A new `blob/`

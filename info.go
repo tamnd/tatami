@@ -19,6 +19,11 @@ type ColumnStat struct {
 	BlobCompressed   int64
 	BlobRuns         int
 	BlobDict         bool // true when the column kept a shared dictionary
+	// Index fields summarize the M3 pruning structures the column carries.
+	HasZone      bool // a chunk-level zone map on at least one group
+	HasBloom     bool // a membership filter on at least one group
+	HasPageIndex bool // a per-page index (the sort column carries one)
+	IsSortKey    bool // the file's sort column
 }
 
 // FileInfo is a read-only summary of a file for the CLI.
@@ -34,6 +39,11 @@ type FileInfo struct {
 	// NumDicts and DictUncompressed summarize the dict region.
 	NumDicts         int
 	DictUncompressed int64
+	// NumBlooms is the count of membership filters in the index region; Sorted
+	// and SortColumn describe the primary-key index.
+	NumBlooms  int
+	Sorted     bool
+	SortColumn string
 }
 
 // KeyValue is one footer key-value metadata pair.
@@ -69,8 +79,23 @@ func (r *Reader) Info() FileInfo {
 			cs.NumPages += int64(c.numPages)
 			cs.TotalUncompressed += c.totalUncompressed
 			cs.TotalCompressed += c.totalCompressed
+			if c.zone.present {
+				cs.HasZone = true
+			}
+			if c.bloomRef > 0 {
+				cs.HasBloom = true
+			}
+			if c.pageIndexOffset > 0 {
+				cs.HasPageIndex = true
+			}
 		}
 	}
+	if si, ok := r.meta.schema.sortKeyIndex(); ok {
+		fi.Sorted = true
+		fi.SortColumn = r.meta.schema.Fields[si].Name
+		cols[si].IsSortKey = true
+	}
+	fi.NumBlooms = len(r.meta.blooms)
 	for _, bc := range r.meta.blobCols {
 		if bc.columnID < 0 || bc.columnID >= len(cols) {
 			continue

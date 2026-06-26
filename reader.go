@@ -205,6 +205,59 @@ func (r *Reader) ReadColumn(group, col int) (Column, error) {
 	return Column{Data: out, Valid: valid}, nil
 }
 
+// readDataPage reads and decodes one data page at off into a Column. It is the
+// single-page primitive the point lookup uses to touch exactly one page after
+// the index walk.
+func (r *Reader) readDataPage(off int64, t LogicalType) (Column, error) {
+	hb, err := readAt(r.r, off, PageHeaderSize)
+	if err != nil {
+		return Column{}, err
+	}
+	ph, err := decodePageHeader(hb)
+	if err != nil {
+		return Column{}, err
+	}
+	comp, err := readAt(r.r, off+PageHeaderSize, int(ph.compressedSize))
+	if err != nil {
+		return Column{}, err
+	}
+	if got := crc32c(comp); got != ph.payloadCRC32C {
+		return Column{}, fmt.Errorf("tatami: page checksum mismatch at offset %d", off)
+	}
+	cdc, err := codec.ByID(codec.ID(ph.codec))
+	if err != nil {
+		return Column{}, err
+	}
+	plain, err := cdc.Decompress(nil, comp, int(ph.uncompressedSize))
+	if err != nil {
+		return Column{}, err
+	}
+	num := int(ph.numValues)
+	var bitmap []byte
+	body := plain
+	if ph.flags&pageFlagNullsPresent != 0 {
+		bl := validityBytes(num)
+		if bl > len(plain) {
+			return Column{}, fmt.Errorf("tatami: validity bitmap overruns page")
+		}
+		bitmap = plain[:bl]
+		body = plain[bl:]
+	}
+	vals, err := decodePageValues(t, ph.encoding, body, num, bitmap)
+	if err != nil {
+		return Column{}, err
+	}
+	out := appendTyped(t, emptyTyped(t), vals)
+	var valid []bool
+	if ph.flags&pageFlagNullsPresent != 0 {
+		valid = make([]bool, num)
+		for i := 0; i < num; i++ {
+			valid[i] = validAt(bitmap, i)
+		}
+	}
+	return Column{Data: out, Valid: valid}, nil
+}
+
 // ReadRowGroup reads every column of one row group.
 func (r *Reader) ReadRowGroup(group int) ([]Column, error) {
 	cols := make([]Column, len(r.meta.schema.Fields))
