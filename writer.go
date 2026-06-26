@@ -333,19 +333,23 @@ type invertedAttachment struct {
 	termDict []byte
 	postings []byte
 	skips    []byte
+	live     []byte
 	numTerms uint64
 	numDocs  uint64
 }
 
-// AttachInverted hands the writer the three serialized runs of an inverted
-// sub-region, turning the file it produces into a search segment (role bit 4).
-// It must be called before Close. The runs are written into the index region and
-// addressed by the footer's inverted descriptor.
-func (w *Writer) AttachInverted(termDict, postings, skips []byte, numTerms, numDocs uint64) {
+// AttachInverted hands the writer the four serialized runs of an inverted
+// sub-region (term dictionary, posting payloads, skip tables, and the live-docs
+// bitset), turning the file it produces into a search segment (role bit 4). It
+// must be called before Close. The runs are written into the index region and
+// addressed by the footer's inverted descriptor. A nil live run records no
+// deletions, which a reader treats as all-live.
+func (w *Writer) AttachInverted(termDict, postings, skips, live []byte, numTerms, numDocs uint64) {
 	w.inverted = &invertedAttachment{
 		termDict: termDict,
 		postings: postings,
 		skips:    skips,
+		live:     live,
 		numTerms: numTerms,
 		numDocs:  numDocs,
 	}

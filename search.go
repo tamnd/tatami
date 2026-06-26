@@ -131,7 +131,10 @@ func (b *SearchBuilder) Write(path string, opts WriterOptions) error {
 		return err
 	}
 	td, pp, sk := search.EncodeInverted(inv)
-	w.AttachInverted(td, pp, sk, uint64(inv.NumTerms()), uint64(inv.NumDocs()))
+	// A freshly built segment has no deletions, so it carries no live-docs run; a
+	// reader treats its absence as all-live. Deletions are made on the open
+	// segment and materialized at the next merge, which drops them.
+	w.AttachInverted(td, pp, sk, nil, uint64(inv.NumTerms()), uint64(inv.NumDocs()))
 	if err := w.Close(); err != nil {
 		_ = f.Close()
 		return err
@@ -176,6 +179,8 @@ type SearchSegment struct {
 	groupFirst []uint64 // firstRow of each row group, for docID -> group mapping
 	urlCache   map[int][]string
 	titleCache map[int][]string
+	idCache    map[int][]string  // doc_id column per group, for cross-segment dedup
+	docIndex   map[string]uint32 // global doc_id -> dense docID, built lazily for deletes
 }
 
 // SearchResult is one ranked hit: the dense docID, its stored url and title, and
@@ -223,6 +228,14 @@ func OpenSearch(path string) (*SearchSegment, error) {
 		_ = f.Close()
 		return nil, err
 	}
+	if d.liveLen > 0 {
+		lv, err := r.readIndexRecord(d.liveOff)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		inv.SetLive(search.DecodeLive(lv))
+	}
 	first := make([]uint64, r.NumRowGroups())
 	for g := range first {
 		first[g] = r.meta.groups[g].firstRow
@@ -234,17 +247,72 @@ func OpenSearch(path string) (*SearchSegment, error) {
 		groupFirst: first,
 		urlCache:   map[int][]string{},
 		titleCache: map[int][]string{},
+		idCache:    map[int][]string{},
 	}, nil
 }
 
 // Close releases the underlying file.
 func (s *SearchSegment) Close() error { return s.f.Close() }
 
-// NumDocs returns the dense doc-id space size.
+// NumDocs returns the dense doc-id space size, including deleted documents. It
+// is the N that IDF is defined over until a merge removes the deletions.
 func (s *SearchSegment) NumDocs() int { return s.inv.NumDocs() }
+
+// LiveDocs returns the number of documents not yet deleted, the size class the
+// merge policy tiers on.
+func (s *SearchSegment) LiveDocs() int { return s.inv.LiveDocs() }
+
+// NumDeleted returns the number of deleted documents.
+func (s *SearchSegment) NumDeleted() int { return s.inv.NumDeleted() }
 
 // NumTerms returns the distinct term count.
 func (s *SearchSegment) NumTerms() int { return s.inv.NumTerms() }
+
+// DeleteDense marks a dense doc id deleted in the in-memory live bitset. The
+// deletion is honored by every later query on this open segment and is
+// materialized (the document dropped) at the next merge. It is not written back
+// to the immutable file; durable deletes across a reopen are a tombstone-sidecar
+// refinement (09-search-scale.md, section 7). It returns true when the call
+// changed the state.
+func (s *SearchSegment) DeleteDense(d uint32) bool {
+	return s.inv.Delete(search.DocID(d))
+}
+
+// Delete marks the document with the given global doc_id deleted, resolving it to
+// its dense id through a lazily built index over the doc_id column. It returns
+// false when the doc_id is not in this segment.
+func (s *SearchSegment) Delete(docID string) (bool, error) {
+	if s.docIndex == nil {
+		if err := s.buildDocIndex(); err != nil {
+			return false, err
+		}
+	}
+	dense, ok := s.docIndex[docID]
+	if !ok {
+		return false, nil
+	}
+	return s.DeleteDense(dense), nil
+}
+
+// buildDocIndex reads the doc_id column across every row group and maps each
+// global doc_id to its dense id, so a delete keyed by the stable identity can
+// find the ephemeral one.
+func (s *SearchSegment) buildDocIndex() error {
+	idx := make(map[string]uint32, s.inv.NumDocs())
+	for g := 0; g < s.r.NumRowGroups(); g++ {
+		col, err := s.r.ReadColumn(g, 0) // doc_id
+		if err != nil {
+			return err
+		}
+		ids := col.Data.([]string)
+		base := uint32(s.groupFirst[g])
+		for i, id := range ids {
+			idx[id] = base + uint32(i)
+		}
+	}
+	s.docIndex = idx
+	return nil
+}
 
 // Inverted exposes the decoded inverted index for retrieval-only callers (the
 // latency benchmark measures this path without the stored-field fetch).
@@ -305,6 +373,30 @@ func (s *SearchSegment) storedFields(docID uint32) (url, title string, err error
 		return "", "", fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)
 	}
 	return urls[off], titles[off], nil
+}
+
+// globalDocID returns the stable doc_id of a dense docID, reading the doc_id
+// column once per group and caching it. The serving layer uses it to dedup the
+// same page surfaced by more than one segment after a recrawl.
+func (s *SearchSegment) globalDocID(docID uint32) (string, error) {
+	g := s.groupOf(docID)
+	if g < 0 {
+		return "", fmt.Errorf("tatami: docID %d out of range", docID)
+	}
+	off := int(uint64(docID) - s.groupFirst[g])
+	ids, ok := s.idCache[g]
+	if !ok {
+		col, err := s.r.ReadColumn(g, 0) // doc_id
+		if err != nil {
+			return "", err
+		}
+		ids = col.Data.([]string)
+		s.idCache[g] = ids
+	}
+	if off < 0 || off >= len(ids) {
+		return "", fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)
+	}
+	return ids[off], nil
 }
 
 // groupOf returns the row group holding a dense docID, or -1 when out of range.

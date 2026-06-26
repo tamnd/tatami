@@ -81,20 +81,87 @@ func (b *InvertedBuilder) Build() (*Inverted, error) {
 			PostingOffset: int64(idx),
 		}})
 	}
-	return &Inverted{dict: NewSortedDict(termList), lists: lists, numDocs: b.numDocs}, nil
+	return &Inverted{dict: NewSortedDict(termList), lists: lists, numDocs: b.numDocs, live: NewLive(b.numDocs)}, nil
 }
 
 // Inverted is an immutable, queryable inverted index: a term dictionary, the
-// posting lists it points at, and the document count. It is safe for concurrent
-// readers.
+// posting lists it points at, the document count, and a live-docs bitset. The
+// posting lists are immutable; only the live bitset mutates, on a delete. It is
+// safe for concurrent readers but not for a reader racing a Delete.
 type Inverted struct {
 	dict    *SortedDict
 	lists   []*List
 	numDocs int
+	live    *Live
 }
 
-// NumDocs returns the dense doc-id space size N, the input to IDF.
+// NumDocs returns the dense doc-id space size N, the input to IDF. It counts
+// deleted documents too, because IDF is defined over the segment as built; a
+// merge is what actually removes deleted documents from N.
 func (inv *Inverted) NumDocs() int { return inv.numDocs }
+
+// LiveDocs returns the number of documents not yet deleted.
+func (inv *Inverted) LiveDocs() int {
+	if inv.live == nil {
+		return inv.numDocs
+	}
+	return inv.live.Count()
+}
+
+// NumDeleted returns the number of deleted documents.
+func (inv *Inverted) NumDeleted() int { return inv.numDocs - inv.LiveDocs() }
+
+// IsLive reports whether a dense doc id is still live.
+func (inv *Inverted) IsLive(d DocID) bool {
+	if inv.live == nil {
+		return int(d) >= 0 && int(d) < inv.numDocs
+	}
+	return inv.live.Get(int(d))
+}
+
+// Delete marks a dense doc id deleted. It returns true when the call changed the
+// state. The posting lists are untouched; the document is filtered at query time
+// and dropped at the next merge (09-search-scale.md, section 7).
+func (inv *Inverted) Delete(d DocID) bool {
+	if inv.live == nil {
+		inv.live = NewLive(inv.numDocs)
+	}
+	return inv.live.Clear(int(d))
+}
+
+// Live returns the live-docs bitset, or nil when none was attached (treated as
+// all-live).
+func (inv *Inverted) Live() *Live { return inv.live }
+
+// SetLive attaches a live-docs bitset, used when reloading a segment whose
+// deletions were persisted in the inverted sub-region.
+func (inv *Inverted) SetLive(l *Live) { inv.live = l }
+
+// PerDocFreqs reconstructs, for every live document, its term-to-frequency map by
+// walking every posting list once. It is the input to a merge, which re-adds each
+// live document to a fresh builder so the merged segment's postings are rebuilt
+// from scratch with new dense ids (09-search-scale.md, section 7). Deleted
+// documents are omitted, so the merged segment reclaims their space.
+func (inv *Inverted) PerDocFreqs() []map[string]uint32 {
+	perDoc := make([]map[string]uint32, inv.numDocs)
+	for _, t := range inv.dict.Terms() {
+		cur, _, ok := inv.Postings(t.Term)
+		if !ok {
+			continue
+		}
+		for cur.Next() {
+			d := int(cur.Doc())
+			if !inv.IsLive(cur.Doc()) {
+				continue
+			}
+			if perDoc[d] == nil {
+				perDoc[d] = make(map[string]uint32)
+			}
+			perDoc[d][t.Term] = cur.Freq()
+		}
+	}
+	return perDoc
+}
 
 // NumTerms returns the number of distinct terms.
 func (inv *Inverted) NumTerms() int { return inv.dict.Len() }
@@ -158,7 +225,12 @@ func (inv *Inverted) Search(terms []string, k int) []Hit {
 			MaxFreq: inv.MaxFreq(t),
 		})
 	}
-	return WAND(inputs, k)
+	// When nothing is deleted, take the plain path so the common case pays no
+	// per-document liveness check.
+	if inv.live == nil || inv.live.AllLive() {
+		return WAND(inputs, k)
+	}
+	return WANDFilter(inputs, k, func(d DocID) bool { return inv.live.Get(int(d)) })
 }
 
 // EncodeInverted serializes an inverted index into the three byte runs of the

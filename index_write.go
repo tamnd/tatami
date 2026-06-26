@@ -86,6 +86,13 @@ func (w *Writer) writeIndexRegion() error {
 		if err != nil {
 			return err
 		}
+		var lvOff int64
+		if len(w.inverted.live) > 0 {
+			lvOff, err = w.writeIndexRecord(PageIdx, w.inverted.live)
+			if err != nil {
+				return err
+			}
+		}
 		w.meta.invert = invertDesc{
 			present:     true,
 			termDictOff: tdOff,
@@ -96,6 +103,8 @@ func (w *Writer) writeIndexRegion() error {
 			skipsLen:    int64(len(w.inverted.skips)),
 			numTerms:    w.inverted.numTerms,
 			numDocs:     w.inverted.numDocs,
+			liveOff:     lvOff,
+			liveLen:     int64(len(w.inverted.live)),
 		}
 	}
 	return nil
