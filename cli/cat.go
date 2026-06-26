@@ -23,7 +23,7 @@ func newCatCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			schema := r.Schema()
 
 			sel := make([]int, 0, len(schema.Fields))
@@ -49,7 +49,6 @@ func newCatCmd() *cobra.Command {
 			}
 
 			w := bufio.NewWriter(cmd.OutOrStdout())
-			defer w.Flush()
 			emitted := 0
 			for g := 0; g < r.NumRowGroups(); g++ {
 				cols := make([]tatami.Column, len(sel))
@@ -62,16 +61,20 @@ func newCatCmd() *cobra.Command {
 				}
 				rows := r.RowGroupRows(g)
 				for i := 0; i < rows; i++ {
-					if err := writeRow(w, schema, sel, cols, i); err != nil {
+					line, err := encodeRow(schema, sel, cols, i)
+					if err != nil {
+						return err
+					}
+					if _, err := w.WriteString(line); err != nil {
 						return err
 					}
 					emitted++
 					if limit > 0 && emitted >= limit {
-						return nil
+						return w.Flush()
 					}
 				}
 			}
-			return nil
+			return w.Flush()
 		},
 	}
 	cmd.Flags().StringVar(&columns, "columns", "", "comma-separated columns to project (default all)")
@@ -79,22 +82,23 @@ func newCatCmd() *cobra.Command {
 	return cmd
 }
 
-// writeRow emits one jsonl object, keeping the schema column order.
-func writeRow(w *bufio.Writer, schema *tatami.Schema, sel []int, cols []tatami.Column, i int) error {
-	w.WriteByte('{')
+// encodeRow renders one jsonl object, keeping the schema column order.
+func encodeRow(schema *tatami.Schema, sel []int, cols []tatami.Column, i int) (string, error) {
+	var b strings.Builder
+	b.WriteByte('{')
 	for j, idx := range sel {
 		if j > 0 {
-			w.WriteByte(',')
+			b.WriteByte(',')
 		}
 		key, _ := json.Marshal(schema.Fields[idx].Name)
-		w.Write(key)
-		w.WriteByte(':')
+		b.Write(key)
+		b.WriteByte(':')
 		val, err := json.Marshal(cols[j].At(i))
 		if err != nil {
-			return err
+			return "", err
 		}
-		w.Write(val)
+		b.Write(val)
 	}
-	w.WriteByte('}')
-	return w.WriteByte('\n')
+	b.WriteString("}\n")
+	return b.String(), nil
 }

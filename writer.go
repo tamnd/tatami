@@ -97,7 +97,7 @@ func Create(path string, schema *Schema, opts WriterOptions) (*Writer, *os.File,
 	}
 	w, err := NewWriter(f, schema, opts)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, nil, err
 	}
 	return w, f, nil

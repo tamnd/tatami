@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -18,34 +20,36 @@ func newInspectCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			info := r.Info()
-			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "file:    %s\n", args[0])
-			fmt.Fprintf(out, "version: %d.%d\n", info.Header.VersionMajor, info.Header.VersionMinor)
-			fmt.Fprintf(out, "rows:    %d\n", info.RowCount)
-			fmt.Fprintf(out, "groups:  %d\n", info.NumRowGroups)
+
+			var b strings.Builder
+			fmt.Fprintf(&b, "file:    %s\n", args[0])
+			fmt.Fprintf(&b, "version: %d.%d\n", info.Header.VersionMajor, info.Header.VersionMinor)
+			fmt.Fprintf(&b, "rows:    %d\n", info.RowCount)
+			fmt.Fprintf(&b, "groups:  %d\n", info.NumRowGroups)
 			searchSeg := info.Header.Flags&tatami.FlagRoleSearchSeg != 0
-			fmt.Fprintf(out, "role:    %s\n", roleName(searchSeg))
+			fmt.Fprintf(&b, "role:    %s\n", roleName(searchSeg))
 			ratio := 1.0
 			if info.CompressedTotal > 0 {
 				ratio = float64(info.UncompressedTotal) / float64(info.CompressedTotal)
 			}
-			fmt.Fprintf(out, "size:    %d compressed / %d uncompressed (%.2fx)\n",
+			fmt.Fprintf(&b, "size:    %d compressed / %d uncompressed (%.2fx)\n",
 				info.CompressedTotal, info.UncompressedTotal, ratio)
-			fmt.Fprintln(out, "columns:")
+			b.WriteString("columns:\n")
 			for _, c := range info.Columns {
-				fmt.Fprintf(out, "  %-20s %-16s enc=%s codec=%s values=%d nulls=%d pages=%d %d->%d bytes\n",
+				fmt.Fprintf(&b, "  %-20s %-16s enc=%s codec=%s values=%d nulls=%d pages=%d %d->%d bytes\n",
 					c.Name, c.Type, c.Encoding, c.Codec, c.NumValues, c.NullCount, c.NumPages,
 					c.TotalUncompressed, c.TotalCompressed)
 			}
 			if len(info.KeyValue) > 0 {
-				fmt.Fprintln(out, "metadata:")
+				b.WriteString("metadata:\n")
 				for _, kv := range info.KeyValue {
-					fmt.Fprintf(out, "  %s = %s\n", kv.Key, kv.Value)
+					fmt.Fprintf(&b, "  %s = %s\n", kv.Key, kv.Value)
 				}
 			}
-			return nil
+			_, err = io.WriteString(cmd.OutOrStdout(), b.String())
+			return err
 		},
 	}
 }

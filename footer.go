@@ -36,14 +36,6 @@ type chunkMeta struct {
 	codec             Codec
 }
 
-// chunk flag bits, reserved for the optional fields later milestones add.
-const (
-	chunkFlagZoneMap   uint8 = 1 << 0
-	chunkFlagBloom     uint8 = 1 << 1
-	chunkFlagPageIndex uint8 = 1 << 2
-	chunkFlagDictRef   uint8 = 1 << 3
-)
-
 // rowGroupMeta is the footer entry for one row group (03 section 5).
 type rowGroupMeta struct {
 	firstRow   uint64

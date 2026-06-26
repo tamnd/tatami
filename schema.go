@@ -109,13 +109,3 @@ func (s *Schema) sortKeyIndex() (int, bool) {
 	}
 	return -1, false
 }
-
-// fieldIndex returns the index of the named column, or -1.
-func (s *Schema) fieldIndex(name string) int {
-	for i, f := range s.Fields {
-		if f.Name == name {
-			return i
-		}
-	}
-	return -1
-}
