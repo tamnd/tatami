@@ -35,7 +35,7 @@ func TestSearchSegmentEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer seg.Close()
+	defer func() { _ = seg.Close() }()
 
 	if seg.NumDocs() != len(docs) {
 		t.Fatalf("segment NumDocs %d want %d", seg.NumDocs(), len(docs))
@@ -114,7 +114,7 @@ func TestSearchSegmentManyGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer seg.Close()
+	defer func() { _ = seg.Close() }()
 
 	res, err := seg.Search("rareword", 20)
 	if err != nil {
