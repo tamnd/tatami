@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M6 search-segment role. A tatami file can now be a search index, not only a
+  cold document store. A header role bit turns the same container into a search
+  segment: a forward store laid out as columns indexed by a dense document id
+  (`doc_id`, `url`, `title`, a blob-separated `body`, and four `norm_*` length
+  columns) plus an inverted sub-region in the index region carrying the term
+  dictionary, the postings, and the per-list skip tables. Retrieval is block-max
+  WAND over a posting codec ported from openindex (128-doc blocks, FOR
+  bit-packing, group-varint tails, PForDelta frequencies) with a singleton fast
+  path for the long tail of hapax terms, and an exact top-k under a monotonic
+  BM25 scorer (verified against an exhaustive scan). A full BM25F scorer with
+  field weights is kept for an optional re-rank, which is why the per-field norms
+  are stored. The role is flag-gated, so a document-store file from earlier
+  milestones decodes unchanged. The retrieval core lives in a self-contained
+  `search/` subpackage; `SearchBuilder` and `SearchSegment` in the root package
+  tie it to the container. On the production ccrawl-cli markdown shard, 20246
+  documents and 1.4 million terms, the keyword query p99 is 237 microseconds,
+  more than forty times under the ten millisecond goal.
 - M5 fleet adoption. A new `convert/` subpackage reads a producer's zstd Parquet
   shard (ami or ccrawl-cli output) and re-encodes it as tatami, the bridge that
   lets existing crawl output gain blob separation, shared dictionaries, and

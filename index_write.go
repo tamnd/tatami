@@ -58,8 +58,9 @@ func (w *Writer) buildGroupBloom(t LogicalType, col Column) int {
 }
 
 // writeIndexRegion writes every buffered bloom filter as an index record and
-// records its descriptor, so the footer can address each by offset. It runs at
-// Close after the blob and dict regions.
+// records its descriptor, so the footer can address each by offset. It then
+// writes the inverted sub-region, when one is attached, as three more index
+// records. It runs at Close after the blob and dict regions.
 func (w *Writer) writeIndexRegion() error {
 	for _, blob := range w.pendingBlooms {
 		off, err := w.writeIndexRecord(PageIdx, blob)
@@ -71,6 +72,31 @@ func (w *Writer) writeIndexRegion() error {
 			length:       int64(len(blob)),
 			kind:         0, // bloom; ribbon reserved for a later slice
 		})
+	}
+	if w.inverted != nil {
+		tdOff, err := w.writeIndexRecord(PageIdx, w.inverted.termDict)
+		if err != nil {
+			return err
+		}
+		ppOff, err := w.writeIndexRecord(PageIdx, w.inverted.postings)
+		if err != nil {
+			return err
+		}
+		skOff, err := w.writeIndexRecord(PageIdx, w.inverted.skips)
+		if err != nil {
+			return err
+		}
+		w.meta.invert = invertDesc{
+			present:     true,
+			termDictOff: tdOff,
+			termDictLen: int64(len(w.inverted.termDict)),
+			postingsOff: ppOff,
+			postingsLen: int64(len(w.inverted.postings)),
+			skipsOff:    skOff,
+			skipsLen:    int64(len(w.inverted.skips)),
+			numTerms:    w.inverted.numTerms,
+			numDocs:     w.inverted.numDocs,
+		}
 	}
 	return nil
 }
