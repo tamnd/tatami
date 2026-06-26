@@ -173,10 +173,7 @@ func TestClusterSearchExactVsBruteForce(t *testing.T) {
 func bruteForceSearch(t *testing.T, paths []string, routing *search.RoutingIndex, query string, k int) []SearchResult {
 	t.Helper()
 	terms := tokenize(query)
-	perShard := k
-	if len(paths) > 1 {
-		perShard = k * 2
-	}
+	perShard := k * 2
 	type cand struct {
 		score float32
 		path  string
@@ -221,12 +218,12 @@ func bruteForceSearch(t *testing.T, paths []string, routing *search.RoutingIndex
 		if err != nil {
 			t.Fatal(err)
 		}
-		url, title, err := seg.storedFields(rc.dense)
+		f, err := seg.storedFields(rc.dense)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = seg.Close()
-		out = append(out, SearchResult{Doc: rc.dense, URL: url, Title: title, Score: rc.score})
+		out = append(out, SearchResult{Doc: rc.dense, URL: f.url, Title: f.title, Snippet: f.snippet, Score: rc.score})
 	}
 	return out
 }

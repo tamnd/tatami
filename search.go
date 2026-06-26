@@ -19,40 +19,61 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/tamnd/tatami/search"
 )
 
 // Search-segment forward-store column names. The order here is the schema order,
-// so a column's index is stable.
+// so a column's index is stable. Column 3 is the variable one: a full-document
+// segment stores the blob-separated body there, a search-only segment stores a
+// short snippet string in the same slot, so every other column index is identical
+// across the two shapes and the reader tells them apart by the column's type.
 const (
 	colDocID     = "doc_id"
 	colURL       = "url"
 	colTitle     = "title"
 	colBody      = "body"
+	colSnippet   = "snippet"
 	colNormBody  = "norm_body"
 	colNormTitle = "norm_title"
 	colNormAnchr = "norm_anchor"
 	colNormURL   = "norm_url"
 )
 
-// searchSchema is the fixed forward-store schema of a search segment. doc_id is
-// the durable global identity (sha256(url)) and carries a bloom filter for
-// by-id lookup; url and title are short strings; body is blob-separated; the four
-// norm columns are the per-field lengths BM25F reads.
-func searchSchema() *Schema {
+// colVariable is the index of the body-or-snippet column, the one slot whose type
+// differs between a full-document segment and a search-only segment.
+const colVariable = 3
+
+// searchSchema is the forward-store schema of a search segment. doc_id is the
+// durable global identity (sha256(url)) and carries a bloom filter for by-id
+// lookup; url and title are short strings; the four norm columns are the per-field
+// lengths BM25F reads. The middle column depends on the segment shape: a
+// full-document segment blob-separates the body, a search-only segment keeps a
+// short snippet string instead and never stores the body at all
+// (13-search-only-and-scale.md).
+func searchSchema(snippet bool) *Schema {
+	mid := Field{Name: colBody, Type: TypeBlobRef, BlobSeparated: true}
+	if snippet {
+		mid = Field{Name: colSnippet, Type: TypeString}
+	}
 	return &Schema{Fields: []Field{
 		{Name: colDocID, Type: TypeString, BloomFilter: true},
 		{Name: colURL, Type: TypeString},
 		{Name: colTitle, Type: TypeString},
-		{Name: colBody, Type: TypeBlobRef, BlobSeparated: true},
+		mid,
 		{Name: colNormBody, Type: TypeUint16},
 		{Name: colNormTitle, Type: TypeUint16},
 		{Name: colNormAnchr, Type: TypeUint16},
 		{Name: colNormURL, Type: TypeUint16},
 	}}
 }
+
+// DefaultSnippetRunes is the snippet length a search-only builder keeps when its
+// options leave the length zero. It is a lead excerpt long enough to render a
+// result row, far short of the body it replaces.
+const DefaultSnippetRunes = 200
 
 // SearchDoc is one document handed to a SearchBuilder. DocID is the stable global
 // identity; URL, Title, and Body are the stored fields and the text that is
@@ -71,16 +92,50 @@ type SearchDoc struct {
 // term-to-postings map, and records the per-field length norms. The build is
 // in-memory; a streaming builder is a later milestone (matching M4/M5, which
 // defer streaming k-way merge).
+//
+// In search-only mode the builder never retains the body: it tokenizes the body
+// into the inverted index, keeps a short snippet for the result row, and drops the
+// text. That is what lets a search-only segment cost a fraction of a
+// full-document one on disk and in memory (13-search-only-and-scale.md).
 type SearchBuilder struct {
 	docs []SearchDoc
 	inv  *search.InvertedBuilder
 	// norms[docID] is the per-field token count, capped to uint16.
 	norms [][search.NumFields]uint16
+	// snippet mode: snippets[docID] holds the lead excerpt and docs[docID].Body is
+	// blanked, so the body never lives past the indexing of one document.
+	snippet      bool
+	snippetRunes int
+	snippets     []string
 }
 
-// NewSearchBuilder returns an empty builder.
+// SearchBuilderOptions selects the segment shape. Snippet turns on the
+// search-only forward store: no body is stored, only a SnippetRunes-long lead
+// excerpt per document. SnippetRunes defaults to DefaultSnippetRunes.
+type SearchBuilderOptions struct {
+	Snippet      bool
+	SnippetRunes int
+}
+
+// NewSearchBuilder returns an empty full-document builder, the shape that stores
+// the body blob-separated.
 func NewSearchBuilder() *SearchBuilder {
 	return &SearchBuilder{inv: search.NewInvertedBuilder()}
+}
+
+// NewSearchBuilderWith returns a builder of the shape the options select. A
+// search-only builder indexes every document's body into the postings exactly as
+// the full-document builder does, so the two produce identical retrieval, and
+// differs only in what it keeps in the forward store.
+func NewSearchBuilderWith(opts SearchBuilderOptions) *SearchBuilder {
+	b := &SearchBuilder{inv: search.NewInvertedBuilder(), snippet: opts.Snippet}
+	if opts.Snippet {
+		b.snippetRunes = opts.SnippetRunes
+		if b.snippetRunes <= 0 {
+			b.snippetRunes = DefaultSnippetRunes
+		}
+	}
+	return b
 }
 
 // Add tokenizes a document, records its per-field term frequencies and length
@@ -105,6 +160,10 @@ func (b *SearchBuilder) Add(doc SearchDoc) {
 
 	b.inv.AddDocument(freqs)
 	b.norms = append(b.norms, norm)
+	if b.snippet {
+		b.snippets = append(b.snippets, makeSnippet(doc.Body, b.snippetRunes))
+		doc.Body = "" // the body is indexed; do not carry it past this point
+	}
 	b.docs = append(b.docs, doc)
 }
 
@@ -119,7 +178,7 @@ func (b *SearchBuilder) Write(path string, opts WriterOptions) error {
 	if err != nil {
 		return err
 	}
-	schema := searchSchema()
+	schema := searchSchema(b.snippet)
 	w, f, err := Create(path, schema, opts)
 	if err != nil {
 		return err
@@ -143,12 +202,13 @@ func (b *SearchBuilder) Write(path string, opts WriterOptions) error {
 }
 
 // forwardColumns materializes the forward store as typed columns in docID order.
+// The middle column is the body blob run for a full-document segment or the
+// snippet string for a search-only segment, matching searchSchema.
 func (b *SearchBuilder) forwardColumns() []Column {
 	n := len(b.docs)
 	docID := make([]string, n)
 	url := make([]string, n)
 	title := make([]string, n)
-	body := make([][]byte, n)
 	nb := make([]uint16, n)
 	nt := make([]uint16, n)
 	na := make([]uint16, n)
@@ -157,39 +217,138 @@ func (b *SearchBuilder) forwardColumns() []Column {
 		docID[i] = d.DocID
 		url[i] = d.URL
 		title[i] = d.Title
-		body[i] = []byte(d.Body)
 		nb[i] = b.norms[i][search.FieldBody]
 		nt[i] = b.norms[i][search.FieldTitle]
 		na[i] = b.norms[i][search.FieldAnchor]
 		nu[i] = b.norms[i][search.FieldURL]
 	}
+	var mid Column
+	if b.snippet {
+		snip := make([]string, n)
+		copy(snip, b.snippets)
+		mid = Column{Data: snip}
+	} else {
+		body := make([][]byte, n)
+		for i, d := range b.docs {
+			body[i] = []byte(d.Body)
+		}
+		mid = Column{Data: body}
+	}
 	return []Column{
-		{Data: docID}, {Data: url}, {Data: title}, {Data: body},
+		{Data: docID}, {Data: url}, {Data: title}, mid,
 		{Data: nb}, {Data: nt}, {Data: na}, {Data: nu},
 	}
+}
+
+// makeSnippet builds a result-row excerpt from a document body: it collapses every
+// run of whitespace to a single space, trims the ends, and keeps the first
+// maxRunes runes, cutting back to the last word boundary so the excerpt does not
+// end mid-word. It appends a plain three-dot marker when it truncated. The body is
+// already indexed by the time this runs, so the snippet is purely for display.
+func makeSnippet(body string, maxRunes int) string {
+	if maxRunes <= 0 {
+		maxRunes = DefaultSnippetRunes
+	}
+	var sb strings.Builder
+	space := false
+	count := 0
+	for _, r := range body {
+		if unicode.IsSpace(r) {
+			space = true
+			continue
+		}
+		if space && sb.Len() > 0 {
+			sb.WriteByte(' ')
+			count++
+			if count >= maxRunes {
+				break
+			}
+		}
+		space = false
+		sb.WriteRune(r)
+		count++
+		if count >= maxRunes {
+			break
+		}
+	}
+	s := sb.String()
+	if count < maxRunes {
+		return s
+	}
+	// Truncated: cut back to the last word boundary so the tail is a whole word,
+	// then mark the cut.
+	if i := strings.LastIndexByte(s, ' '); i > 0 {
+		s = s[:i]
+	}
+	return s + "..."
 }
 
 // SearchSegment is a read-only view of a search-segment file: the tatami reader
 // for the forward store plus the decoded inverted index for retrieval. It is the
 // served handle.
+//
+// It is safe for concurrent queries. The retrieval path (SearchTermsWith) is
+// reentrant: the WAND loop allocates its posting cursors per call and the scorer
+// is a value type, so two goroutines searching the same segment never share
+// mutable state. The stored-field path lazily caches the small display columns
+// per row group; those caches are guarded by mu, with the column read done
+// outside the lock so concurrent fetches do not serialize on I/O. Delete mutates
+// the live bitset in place and is therefore not safe to run while queries are in
+// flight; a served segment is treated as immutable (14-serving.md).
 type SearchSegment struct {
 	r          *Reader
 	f          *os.File
 	inv        *search.Inverted
 	groupFirst []uint64 // firstRow of each row group, for docID -> group mapping
-	urlCache   map[int][]string
-	titleCache map[int][]string
-	idCache    map[int][]string  // doc_id column per group, for cross-segment dedup
-	docIndex   map[string]uint32 // global doc_id -> dense docID, built lazily for deletes
+	snippet    bool     // true when column 3 is a snippet string, not a body blob
+
+	mu           sync.RWMutex
+	urlCache     map[int][]string
+	titleCache   map[int][]string
+	snippetCache map[int][]string
+	idCache      map[int][]string  // doc_id column per group, for cross-segment dedup
+	docIndex     map[string]uint32 // global doc_id -> dense docID, built lazily for deletes
 }
 
-// SearchResult is one ranked hit: the dense docID, its stored url and title, and
-// the relevance score.
+// groupStrings returns the string column col for row group g, reading it once and
+// caching it. The read happens outside the lock so concurrent first-touches of
+// different groups do not serialize, and a lost race on the same group just
+// discards the duplicate read. After warmup every call is a read-locked map hit,
+// so thousands of concurrent fetches against one segment run without contending.
+func (s *SearchSegment) groupStrings(cache map[int][]string, g, col int) ([]string, error) {
+	s.mu.RLock()
+	v, ok := cache[g]
+	s.mu.RUnlock()
+	if ok {
+		return v, nil
+	}
+	c, err := s.r.ReadColumn(g, col)
+	if err != nil {
+		return nil, err
+	}
+	data := c.Data.([]string)
+	s.mu.Lock()
+	if existing, ok := cache[g]; ok {
+		data = existing
+	} else {
+		cache[g] = data
+	}
+	s.mu.Unlock()
+	return data, nil
+}
+
+// SearchResult is one ranked hit: the dense docID, the stable global doc_id, the
+// stored url, title, and snippet, and the relevance score. Snippet is empty on a
+// full-document segment, which stores the body rather than a precomputed excerpt.
+// DocID is the durable identity an aggregator dedups and tie-breaks on so a
+// fleet-wide merge orders documents exactly as a single broker would.
 type SearchResult struct {
-	Doc   uint32
-	URL   string
-	Title string
-	Score float32
+	Doc     uint32
+	DocID   string
+	URL     string
+	Title   string
+	Snippet string
+	Score   float32
 }
 
 // OpenSearch opens a search-segment file and decodes its inverted sub-region. It
@@ -240,14 +399,20 @@ func OpenSearch(path string) (*SearchSegment, error) {
 	for g := range first {
 		first[g] = r.meta.groups[g].firstRow
 	}
+	snippet := false
+	if sc := r.Schema(); sc != nil && len(sc.Fields) > colVariable {
+		snippet = sc.Fields[colVariable].Type == TypeString
+	}
 	return &SearchSegment{
-		r:          r,
-		f:          f,
-		inv:        inv,
-		groupFirst: first,
-		urlCache:   map[int][]string{},
-		titleCache: map[int][]string{},
-		idCache:    map[int][]string{},
+		r:            r,
+		f:            f,
+		inv:          inv,
+		groupFirst:   first,
+		snippet:      snippet,
+		urlCache:     map[int][]string{},
+		titleCache:   map[int][]string{},
+		snippetCache: map[int][]string{},
+		idCache:      map[int][]string{},
 	}, nil
 }
 
@@ -267,6 +432,10 @@ func (s *SearchSegment) NumDeleted() int { return s.inv.NumDeleted() }
 
 // NumTerms returns the distinct term count.
 func (s *SearchSegment) NumTerms() int { return s.inv.NumTerms() }
+
+// SnippetOnly reports whether this is a search-only segment: one that stores a
+// snippet for display and not the document body.
+func (s *SearchSegment) SnippetOnly() bool { return s.snippet }
 
 // DeleteDense marks a dense doc id deleted in the in-memory live bitset. The
 // deletion is honored by every later query on this open segment and is
@@ -341,48 +510,59 @@ func (s *SearchSegment) Search(query string, k int) ([]SearchResult, error) {
 	hits := s.Query(query, k)
 	out := make([]SearchResult, 0, len(hits))
 	for _, h := range hits {
-		url, title, err := s.storedFields(uint32(h.Doc))
+		f, err := s.storedFields(uint32(h.Doc))
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SearchResult{Doc: uint32(h.Doc), URL: url, Title: title, Score: float32(h.Score)})
+		id, err := s.globalDocID(uint32(h.Doc))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, SearchResult{Doc: uint32(h.Doc), DocID: id, URL: f.url, Title: f.title, Snippet: f.snippet, Score: float32(h.Score)})
 	}
 	return out, nil
 }
 
-// storedFields returns the url and title of a dense docID. It maps the id to its
-// row group, reads the small url/title columns once per group, and caches them,
-// so a top-k fetch over one group costs two column reads regardless of k. Bodies
-// (blob-separated, large) are fetched only when a caller asks; snippet
-// generation is a later milestone.
-func (s *SearchSegment) storedFields(docID uint32) (url, title string, err error) {
+// stored holds the forward fields of one hit: the display columns a result row
+// needs. snippet is empty on a full-document segment.
+type stored struct {
+	url, title, snippet string
+}
+
+// storedFields returns the display fields of a dense docID. It maps the id to its
+// row group, reads the small url/title columns (and the snippet column on a
+// search-only segment) once per group, and caches them, so a top-k fetch over one
+// group costs a fixed number of column reads regardless of k. A full-document
+// segment leaves the snippet empty; its body is blob-separated and fetched only
+// when a caller asks for it directly.
+func (s *SearchSegment) storedFields(docID uint32) (stored, error) {
 	g := s.groupOf(docID)
 	if g < 0 {
-		return "", "", fmt.Errorf("tatami: docID %d out of range", docID)
+		return stored{}, fmt.Errorf("tatami: docID %d out of range", docID)
 	}
 	off := int(uint64(docID) - s.groupFirst[g])
-	urls, ok := s.urlCache[g]
-	if !ok {
-		col, err := s.r.ReadColumn(g, 1) // url
-		if err != nil {
-			return "", "", err
-		}
-		urls = col.Data.([]string)
-		s.urlCache[g] = urls
+	urls, err := s.groupStrings(s.urlCache, g, 1) // url
+	if err != nil {
+		return stored{}, err
 	}
-	titles, ok := s.titleCache[g]
-	if !ok {
-		col, err := s.r.ReadColumn(g, 2) // title
-		if err != nil {
-			return "", "", err
-		}
-		titles = col.Data.([]string)
-		s.titleCache[g] = titles
+	titles, err := s.groupStrings(s.titleCache, g, 2) // title
+	if err != nil {
+		return stored{}, err
 	}
 	if off < 0 || off >= len(urls) {
-		return "", "", fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)
+		return stored{}, fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)
 	}
-	return urls[off], titles[off], nil
+	out := stored{url: urls[off], title: titles[off]}
+	if s.snippet {
+		snips, err := s.groupStrings(s.snippetCache, g, colVariable) // snippet
+		if err != nil {
+			return stored{}, err
+		}
+		if off < len(snips) {
+			out.snippet = snips[off]
+		}
+	}
+	return out, nil
 }
 
 // globalDocID returns the stable doc_id of a dense docID, reading the doc_id
@@ -394,14 +574,9 @@ func (s *SearchSegment) globalDocID(docID uint32) (string, error) {
 		return "", fmt.Errorf("tatami: docID %d out of range", docID)
 	}
 	off := int(uint64(docID) - s.groupFirst[g])
-	ids, ok := s.idCache[g]
-	if !ok {
-		col, err := s.r.ReadColumn(g, 0) // doc_id
-		if err != nil {
-			return "", err
-		}
-		ids = col.Data.([]string)
-		s.idCache[g] = ids
+	ids, err := s.groupStrings(s.idCache, g, 0) // doc_id
+	if err != nil {
+		return "", err
 	}
 	if off < 0 || off >= len(ids) {
 		return "", fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)

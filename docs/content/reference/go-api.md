@@ -135,3 +135,66 @@ func (ix *Index) Close() error
 ```
 
 `MergeSegments` folds segments into one, dropping deletions and re-deriving dense ids. An `Index` serves many segments behind one query with a global top-k and stable-id dedup. `SelectMerge` applies the tiered policy from the search subpackage (`search.DefaultMergePolicy`) and returns the segment indices to merge.
+
+## Search-only segments
+
+```go
+type SearchBuilderOptions struct {
+	Snippet      bool // store a snippet in place of the body
+	SnippetRunes int  // snippet length; 0 uses DefaultSnippetRunes (200)
+}
+
+func NewSearchBuilderWith(opts SearchBuilderOptions) *SearchBuilder
+func (s *SearchSegment) SnippetOnly() bool
+```
+
+`NewSearchBuilderWith(SearchBuilderOptions{Snippet: true})` builds a segment that tokenises the body, builds the postings, then drops the body for a short snippet, so retrieval is identical to a full-document segment at a fraction of the size. `SnippetOnly` reports which shape an open segment has. `NewSearchBuilder` (no options) still builds a full-document segment.
+
+## Distributed serving
+
+```go
+type ClusterOptions struct {
+	CacheSize int // max segments kept open at once; 0 uses DefaultCacheSize (64)
+}
+
+func OpenCluster(paths []string, opts ClusterOptions) (*Cluster, error)
+func (c *Cluster) Search(query string, k int) ([]SearchResult, QueryStats, error)
+func (c *Cluster) Query(query string, k int) ([]ClusterHit, QueryStats, error)
+func (c *Cluster) NumShards() int
+func (c *Cluster) NumDocs() int
+func (c *Cluster) CacheLen() int
+func (c *Cluster) Close() error
+
+func OpenAggregator(leaves []*Cluster) *Aggregator
+func (a *Aggregator) Search(query string, k int) ([]SearchResult, AggStats, error)
+func (a *Aggregator) NumLeaves() int
+func (a *Aggregator) NumShards() int
+func (a *Aggregator) NumDocs() int
+func (a *Aggregator) Close() error
+```
+
+A `Cluster` is a broker over a fan of shards: it consults a routing index to visit only the shards a query needs, scores them against global statistics for an exact top-k, and keeps only `CacheSize` segments resident. `QueryStats` reports the candidate and visited shard counts and the pruning threshold. An `Aggregator` fans a query across many leaf brokers concurrently and merges an exact fleet-wide top-k; `AggStats` reports the leaf and shard counts. See [distributed serving at scale](/guides/distributed-serving/).
+
+## Serving over HTTP
+
+```go
+const (
+	DefaultCacheSize     = 64
+	DefaultMaxInFlight   = 256
+	DefaultQueryTimeout  = 2 * time.Second
+	DefaultMaxK          = 100
+)
+
+type ServerOptions struct {
+	MaxInFlight int           // concurrent queries before 503; 0 uses DefaultMaxInFlight
+	Timeout     time.Duration // per-request deadline; 0 uses DefaultQueryTimeout
+	MaxK        int           // cap on requested k; 0 uses DefaultMaxK
+	DefaultK    int           // k when a request omits it; 0 means 10
+}
+
+func NewServer(c *Cluster, opts ServerOptions) *Server
+func (s *Server) Handler() http.Handler
+func (s *Server) Drain()
+```
+
+`NewServer` wraps a `Cluster` in an HTTP serving layer with admission control and a per-request deadline; `Handler` returns the mux that serves `/search`, `/healthz`, and `/stats`. `Drain` waits for the in-flight search workers to finish, which a graceful shutdown calls after the HTTP server stops and before the cluster closes. See [serving search over HTTP](/guides/serving-over-http/).

@@ -70,8 +70,20 @@ tatami collection list ./corpus
 
 The manifest records each file's key range and a rollup of its zone statistics, so a query against the collection can skip whole files before opening them.
 
+## 5. Serve search over HTTP
+
+Once a directory holds search segments, serve them over HTTP:
+
+```bash
+tatami serve ./segments --addr :8080
+curl 'localhost:8080/search?q=open+source+software&k=10'
+```
+
+The broker answers each query without a shared lock, so one process handles many concurrent requests, and a smart cache keeps the working set resident.
+
 ## What next
 
 - To write and read files from your own Go code, see [writing and reading files](/guides/writing-and-reading/).
 - To build a keyword search index over a corpus and serve it, see [searching a corpus](/guides/searching-a-corpus/).
+- To serve a fleet of shards behind one query, see [distributed serving at scale](/guides/distributed-serving/) and [serving search over HTTP](/guides/serving-over-http/).
 - For every command and flag, see the [CLI reference](/reference/cli/).

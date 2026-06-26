@@ -21,11 +21,12 @@ import (
 // dense ids. The norms are carried verbatim because they cannot be re-derived
 // from the combined-frequency posting lists.
 type forwardRow struct {
-	docID string
-	url   string
-	title string
-	body  []byte
-	norm  [search.NumFields]uint16
+	docID   string
+	url     string
+	title   string
+	body    []byte // set on a full-document segment
+	snippet string // set on a search-only segment
+	norm    [search.NumFields]uint16
 }
 
 // readForwardAll reads every document's forward fields across all row groups, in
@@ -45,11 +46,20 @@ func (s *SearchSegment) readForwardAll() ([]forwardRow, error) {
 		if err != nil {
 			return nil, err
 		}
-		bodyCol, err := s.r.ReadColumn(g, 3)
-		if err != nil {
-			return nil, err
+		var body [][]byte
+		var snip []string
+		if s.snippet {
+			snip, err = s.readStringColumn(g, colVariable)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			bodyCol, err := s.r.ReadColumn(g, colVariable)
+			if err != nil {
+				return nil, err
+			}
+			body = bodyCol.Data.([][]byte)
 		}
-		body := bodyCol.Data.([][]byte)
 		nb, err := s.readU16Column(g, 4)
 		if err != nil {
 			return nil, err
@@ -67,18 +77,23 @@ func (s *SearchSegment) readForwardAll() ([]forwardRow, error) {
 			return nil, err
 		}
 		for i := range docID {
-			rows = append(rows, forwardRow{
+			r := forwardRow{
 				docID: docID[i],
 				url:   url[i],
 				title: title[i],
-				body:  body[i],
 				norm: [search.NumFields]uint16{
 					search.FieldBody:   nb[i],
 					search.FieldTitle:  nt[i],
 					search.FieldAnchor: na[i],
 					search.FieldURL:    nu[i],
 				},
-			})
+			}
+			if s.snippet {
+				r.snippet = snip[i]
+			} else {
+				r.body = body[i]
+			}
+			rows = append(rows, r)
 		}
 	}
 	return rows, nil
@@ -111,18 +126,23 @@ func MergeSegments(segs []*SearchSegment, outPath string, opts WriterOptions) er
 	if len(segs) == 0 {
 		return fmt.Errorf("tatami: MergeSegments needs at least one segment")
 	}
+	snippet := segs[0].snippet
 	inv := search.NewInvertedBuilder()
 	var (
 		docID []string
 		url   []string
 		title []string
 		body  [][]byte
+		snip  []string
 		nb    []uint16
 		nt    []uint16
 		na    []uint16
 		nu    []uint16
 	)
 	for _, seg := range segs {
+		if seg.snippet != snippet {
+			return fmt.Errorf("tatami: MergeSegments cannot mix snippet and full-document segments")
+		}
 		perDoc := seg.inv.PerDocFreqs()
 		rows, err := seg.readForwardAll()
 		if err != nil {
@@ -141,7 +161,11 @@ func MergeSegments(segs []*SearchSegment, outPath string, opts WriterOptions) er
 			docID = append(docID, r.docID)
 			url = append(url, r.url)
 			title = append(title, r.title)
-			body = append(body, r.body)
+			if snippet {
+				snip = append(snip, r.snippet)
+			} else {
+				body = append(body, r.body)
+			}
 			nb = append(nb, r.norm[search.FieldBody])
 			nt = append(nt, r.norm[search.FieldTitle])
 			na = append(na, r.norm[search.FieldAnchor])
@@ -153,12 +177,18 @@ func MergeSegments(segs []*SearchSegment, outPath string, opts WriterOptions) er
 	if err != nil {
 		return err
 	}
-	w, f, err := Create(outPath, searchSchema(), opts)
+	w, f, err := Create(outPath, searchSchema(snippet), opts)
 	if err != nil {
 		return err
 	}
+	var mid Column
+	if snippet {
+		mid = Column{Data: snip}
+	} else {
+		mid = Column{Data: body}
+	}
 	cols := []Column{
-		{Data: docID}, {Data: url}, {Data: title}, {Data: body},
+		{Data: docID}, {Data: url}, {Data: title}, mid,
 		{Data: nb}, {Data: nt}, {Data: na}, {Data: nu},
 	}
 	if err := w.Append(Batch{Columns: cols}); err != nil {
