@@ -21,9 +21,18 @@ const (
 // footer; a later milestone may zstd it for large files.
 const footerCodecNone byte = 0
 
+// Chunk-entry flag bits. The flags byte gates the optional M3 index fields so an
+// M0/M2 chunk (flags == 0) decodes unchanged and a reader skips a field it was
+// not told is present.
+const (
+	chunkFlagZone      uint8 = 1 << 0 // zone min/max bytes follow
+	chunkFlagBloom     uint8 = 1 << 1 // bloomRef uvarint follows
+	chunkFlagPageIndex uint8 = 1 << 2 // pageIndexOffset uvarint follows
+)
+
 // chunkMeta is the footer entry for one column chunk (03 section 4). M0 fills
-// the size and navigation fields; zone maps, blooms, dictionaries, and page
-// indexes arrive in later milestones and are gated by chunkFlags.
+// the size and navigation fields; M3 adds the zone map, the membership-filter
+// reference, and the per-page index offset, each gated by a flag bit.
 type chunkMeta struct {
 	columnID          int
 	firstPageOffset   int64
@@ -34,6 +43,14 @@ type chunkMeta struct {
 	numPages          int
 	encoding          Encoding
 	codec             Codec
+	// zone is the chunk-level min/max over present values, used to prune the
+	// whole group on a predicate. present == false means no usable zone.
+	zone zoneStat
+	// bloomRef is 0 for no filter, else 1 plus an index into fileMeta.blooms.
+	bloomRef int
+	// pageIndexOffset is the file offset of this chunk's per-page index page, or
+	// 0 when the chunk carries none.
+	pageIndexOffset int64
 }
 
 // rowGroupMeta is the footer entry for one row group (03 section 5).
@@ -42,6 +59,21 @@ type rowGroupMeta struct {
 	numRows    int
 	totalBytes int64
 	chunks     []chunkMeta
+	// sortKeyMin/Max are the encoded bounds of the sort column over the group,
+	// the coarse level of the sparse primary-key index. hasSortBounds is false
+	// on an unsorted file.
+	sortKeyMin    []byte
+	sortKeyMax    []byte
+	hasSortBounds bool
+}
+
+// bloomDesc is one entry in the index region: where a built membership filter
+// lives and which kind it is. kind 0 is bloom; ribbon is reserved for a later
+// slice.
+type bloomDesc struct {
+	recordOffset int64
+	length       int64
+	kind         byte
 }
 
 // kvPair is one KEY_VALUE_META entry, kept as an ordered slice so the footer
@@ -82,6 +114,7 @@ type fileMeta struct {
 	groups            []rowGroupMeta
 	blobCols          []blobColDesc
 	dicts             []dictDesc
+	blooms            []bloomDesc
 	rowCount          uint64
 	kv                []kvPair
 	uncompressedTotal uint64
@@ -91,6 +124,12 @@ type fileMeta struct {
 func appendStr(dst []byte, s string) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(s)))
 	return append(dst, s...)
+}
+
+// appendBytes writes a length-prefixed byte slice, the form zone bounds use.
+func appendBytes(dst, b []byte) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(b)))
+	return append(dst, b...)
 }
 
 func (m *fileMeta) encodeSchema() []byte {
@@ -112,6 +151,15 @@ func (m *fileMeta) encodeRowGroups() []byte {
 		b = binary.AppendUvarint(b, g.firstRow)
 		b = binary.AppendUvarint(b, uint64(g.numRows))
 		b = binary.AppendUvarint(b, uint64(g.totalBytes))
+		var gflags byte
+		if g.hasSortBounds {
+			gflags |= 1
+		}
+		b = append(b, gflags)
+		if g.hasSortBounds {
+			b = appendBytes(b, g.sortKeyMin)
+			b = appendBytes(b, g.sortKeyMax)
+		}
 		b = binary.AppendUvarint(b, uint64(len(g.chunks)))
 		for _, c := range g.chunks {
 			b = binary.AppendUvarint(b, uint64(c.columnID))
@@ -123,7 +171,27 @@ func (m *fileMeta) encodeRowGroups() []byte {
 			b = binary.AppendUvarint(b, uint64(c.numPages))
 			b = append(b, byte(c.encoding))
 			b = append(b, byte(c.codec))
-			b = append(b, 0) // chunk flags, none set in M0
+			var cflags byte
+			if c.zone.present {
+				cflags |= chunkFlagZone
+			}
+			if c.bloomRef > 0 {
+				cflags |= chunkFlagBloom
+			}
+			if c.pageIndexOffset > 0 {
+				cflags |= chunkFlagPageIndex
+			}
+			b = append(b, cflags)
+			if cflags&chunkFlagZone != 0 {
+				b = appendBytes(b, c.zone.min)
+				b = appendBytes(b, c.zone.max)
+			}
+			if cflags&chunkFlagBloom != 0 {
+				b = binary.AppendUvarint(b, uint64(c.bloomRef))
+			}
+			if cflags&chunkFlagPageIndex != 0 {
+				b = binary.AppendUvarint(b, uint64(c.pageIndexOffset))
+			}
 		}
 	}
 	return b
@@ -155,6 +223,35 @@ func (m *fileMeta) encodeDictDesc() []byte {
 		b = binary.AppendUvarint(b, uint64(d.length))
 	}
 	return b
+}
+
+func (m *fileMeta) encodeIndexDesc() []byte {
+	var b []byte
+	b = binary.AppendUvarint(b, uint64(len(m.blooms)))
+	for _, d := range m.blooms {
+		b = binary.AppendUvarint(b, uint64(d.recordOffset))
+		b = binary.AppendUvarint(b, uint64(d.length))
+		b = append(b, d.kind)
+	}
+	return b
+}
+
+func decodeIndexDesc(body []byte, errp *error) []bloomDesc {
+	c := &cursor{b: body}
+	n := c.uvarint()
+	out := make([]bloomDesc, 0, n)
+	for i := uint64(0); i < n && c.err == nil; i++ {
+		d := bloomDesc{}
+		d.recordOffset = int64(c.uvarint())
+		d.length = int64(c.uvarint())
+		d.kind = c.byte1()
+		out = append(out, d)
+	}
+	if c.err != nil {
+		*errp = c.err
+		return nil
+	}
+	return out
 }
 
 func (m *fileMeta) encodeKeyValue() []byte {
@@ -191,6 +288,9 @@ func (m *fileMeta) encodeFooter() []byte {
 	}
 	if len(m.dicts) > 0 {
 		appendSection(secDictDesc, m.encodeDictDesc())
+	}
+	if len(m.blooms) > 0 {
+		appendSection(secIndexDesc, m.encodeIndexDesc())
 	}
 	appendSection(secKeyValue, m.encodeKeyValue())
 	appendSection(secStats, m.encodeStats())
@@ -243,6 +343,23 @@ func (c *cursor) str() string {
 	return s
 }
 
+// lenBytes reads a length-prefixed byte slice and returns a copy, so the result
+// outlives the footer buffer.
+func (c *cursor) lenBytes() []byte {
+	n := c.uvarint()
+	if c.err != nil {
+		return nil
+	}
+	if c.pos+int(n) > len(c.b) {
+		c.err = fmt.Errorf("tatami: footer length-prefixed bytes overrun body")
+		return nil
+	}
+	out := make([]byte, n)
+	copy(out, c.b[c.pos:c.pos+int(n)])
+	c.pos += int(n)
+	return out
+}
+
 func (c *cursor) bytes(n int) []byte {
 	if c.err != nil {
 		return nil
@@ -285,6 +402,8 @@ func decodeFooter(raw []byte) (*fileMeta, error) {
 			m.blobCols = decodeBlobDesc(body, &c.err)
 		case secDictDesc:
 			m.dicts = decodeDictDesc(body, &c.err)
+		case secIndexDesc:
+			m.blooms = decodeIndexDesc(body, &c.err)
 		case secKeyValue:
 			m.kv = decodeKeyValue(body, &c.err)
 		case secStats:
@@ -333,6 +452,12 @@ func decodeRowGroups(body []byte, errp *error) []rowGroupMeta {
 		g.firstRow = c.uvarint()
 		g.numRows = int(c.uvarint())
 		g.totalBytes = int64(c.uvarint())
+		gflags := c.byte1()
+		if gflags&1 != 0 {
+			g.sortKeyMin = c.lenBytes()
+			g.sortKeyMax = c.lenBytes()
+			g.hasSortBounds = true
+		}
 		nc := c.uvarint()
 		g.chunks = make([]chunkMeta, 0, nc)
 		for ci := uint64(0); ci < nc && c.err == nil; ci++ {
@@ -346,7 +471,18 @@ func decodeRowGroups(body []byte, errp *error) []rowGroupMeta {
 			cm.numPages = int(c.uvarint())
 			cm.encoding = Encoding(c.byte1())
 			cm.codec = Codec(c.byte1())
-			_ = c.byte1() // chunk flags, ignored in M0
+			cflags := c.byte1()
+			if cflags&chunkFlagZone != 0 {
+				cm.zone.min = c.lenBytes()
+				cm.zone.max = c.lenBytes()
+				cm.zone.present = true
+			}
+			if cflags&chunkFlagBloom != 0 {
+				cm.bloomRef = int(c.uvarint())
+			}
+			if cflags&chunkFlagPageIndex != 0 {
+				cm.pageIndexOffset = int64(c.uvarint())
+			}
 			g.chunks = append(g.chunks, cm)
 		}
 		groups = append(groups, g)
