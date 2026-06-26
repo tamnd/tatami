@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- M8 distributed serving at shard scale. A broker now serves a large fan of cold
+  shards behind one query, visiting only the shards that can contribute and
+  keeping a bounded working set open, with an exact cross-shard top-k. Global
+  statistics injection (`search.GlobalStats`, `Inverted.SearchWith`) scores every
+  shard against the same corpus-wide document count and per-term document
+  frequency, so the merged top-k equals the top-k of a monolith over every shard;
+  this closes the best-effort merge M7 left open. A routing index
+  (`search.RoutingIndex`, `Route`, `EncodeRouting`/`DecodeRouting`) maps each term
+  to the shards that hold it with a per-shard impact bound, so a query walks
+  shards in descending bound order and stops the moment the next bound cannot beat
+  the current k-th best score; because BM25 here runs with b=0 the bound is a true
+  upper bound and the pruned result is byte-identical to a full fan-out. A
+  `Cluster` broker (`OpenCluster`, `Query`, `Search`) drives the routed walk over a
+  lazy LRU segment cache, so the open-file count is the cache cap and not the
+  shard count, and `Search` dedups a re-crawled page by stable doc_id. On a real
+  ccrawl shard split into 254 shards with a 128-segment cache, keyword retrieval
+  p99 is 1.32 ms, with selective queries pruning 254 candidate shards to nine or
+  ten. A detailed compression report (`convert/compress_report_test.go`) accounts
+  for every column on a real shard: the tatami file is 26.1 percent smaller than
+  its zstd Parquet source, the shared-dictionary blob region carries the markdown
+  body at 36.78 MiB against Parquet's 50.38 MiB, and the file holds 105.81 MiB of
+  raw bytes in 38.44 MiB, a 2.75x in-file ratio. Design in Spec 2066
+  `12-distributed-serving.md`; implementation note 9.
+
 ## [0.1.0] - 2026-06-26
 
 The first release. tatami ships as a columnar single-file format and a search
