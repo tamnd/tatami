@@ -38,5 +38,6 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newCatCmd())
 	root.AddCommand(newConvertCmd())
 	root.AddCommand(newCollectionCmd())
+	root.AddCommand(newServeCmd())
 	return root
 }
