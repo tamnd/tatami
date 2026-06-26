@@ -8,6 +8,37 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M10 a concurrent server and a smart cache. The broker now answers thousands of
+  queries at once instead of serializing them behind one lock. The M8 `Cluster`
+  held a single mutex across the whole query path, which is correct for one query
+  and a queue for a thousand, so M10 removed it after an audit confirmed the
+  retrieval path is already reentrant: the WAND loop allocates its cursors per
+  call, the scorer is a value type, the inverted index is read-only during
+  serving, and the M9 search-only segment serves its snippet from a string column
+  so it never takes the blob path that mutates a resolver. A new reference-counted
+  concurrent segment cache (`segcache.go`) replaces the lock-held LRU: the lock
+  guards only the residency bookkeeping and is never held across a file open, a
+  column read, or the WAND loop, `acquire` opens a cold shard outside the lock so
+  it never blocks a warm hit, and a pin per reader defers `Close` until the last
+  reader releases so eviction never races a read. The lazy forward-column caches
+  on `SearchSegment` gained an `RWMutex` with the column read done outside the
+  write lock (`groupStrings`). A new `Server` (`server.go`, `NewServer`,
+  `Handler`) serves `GET /search`, `/healthz`, and `/stats` over the lock-free
+  broker with admission control (a counting semaphore that sheds with 503 when
+  saturated), a per-request deadline (504 on overrun, the slot always freed), and
+  input validation; `tatami serve <dir>` (`cli/serve.go`) globs the segments,
+  builds the routing index, and serves with a graceful drain on SIGINT/SIGTERM.
+  The smart-cache finding is that sub-10ms needs the working set resident: a cache
+  below the visited working set thrashes on cold inverted-index decodes, so the
+  server sizes the cache to hold it. On the real shard split into 254 shards, with
+  the working set warm, single-keyword serving runs a p99 of 1.2 ms at 32,555
+  queries per second under one in-flight query per core, comfortably inside the
+  ten millisecond goal; multi-term phrases stay well under the budget at the
+  median and are bounded at the tail by admission and the deadline rather than
+  gated. Resident segments hold at the cache cap of 128 through five thousand
+  concurrent queries, and four thousand concurrent requests return the exact
+  single-threaded ranking. Design in Spec 2066 `14-serving.md`; implementation
+  note 11.
 - M9 search-only segments and scale to a hundred thousand shards. A search
   segment can now drop the document body it never serves and keep only what a
   result row shows. `NewSearchBuilderWith(SearchBuilderOptions{Snippet: true})`
