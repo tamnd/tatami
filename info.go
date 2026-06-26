@@ -1,6 +1,9 @@
 package tatami
 
 // ColumnStat aggregates one column across all row groups, for inspect and stats.
+// For a separated BLOBREF column the chunk totals cover only the validity pages;
+// the value bytes are reported in the Blob fields, which come from the blob
+// region directory.
 type ColumnStat struct {
 	Name              string
 	Type              LogicalType
@@ -11,6 +14,11 @@ type ColumnStat struct {
 	NumPages          int64
 	TotalUncompressed int64
 	TotalCompressed   int64
+	// Blob fields are non-zero only for separated BLOBREF columns.
+	BlobUncompressed int64
+	BlobCompressed   int64
+	BlobRuns         int
+	BlobDict         bool // true when the column kept a shared dictionary
 }
 
 // FileInfo is a read-only summary of a file for the CLI.
@@ -23,6 +31,9 @@ type FileInfo struct {
 	CompressedTotal   uint64
 	Columns           []ColumnStat
 	KeyValue          []KeyValue
+	// NumDicts and DictUncompressed summarize the dict region.
+	NumDicts         int
+	DictUncompressed int64
 }
 
 // KeyValue is one footer key-value metadata pair.
@@ -60,7 +71,23 @@ func (r *Reader) Info() FileInfo {
 			cs.TotalCompressed += c.totalCompressed
 		}
 	}
+	for _, bc := range r.meta.blobCols {
+		if bc.columnID < 0 || bc.columnID >= len(cols) {
+			continue
+		}
+		cs := &cols[bc.columnID]
+		cs.BlobRuns = len(bc.runs)
+		cs.BlobDict = bc.dictIndex > 0
+		for _, run := range bc.runs {
+			cs.BlobUncompressed += run.uncompressedSize
+			cs.BlobCompressed += run.compressedSize
+		}
+	}
 	fi.Columns = cols
+	fi.NumDicts = len(r.meta.dicts)
+	for _, d := range r.meta.dicts {
+		fi.DictUncompressed += d.length
+	}
 	for _, p := range r.meta.kv {
 		fi.KeyValue = append(fi.KeyValue, KeyValue{p.key, p.value})
 	}

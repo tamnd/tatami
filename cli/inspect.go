@@ -41,6 +41,17 @@ func newInspectCmd() *cobra.Command {
 				fmt.Fprintf(&b, "  %-20s %-16s enc=%s codec=%s values=%d nulls=%d pages=%d %d->%d bytes\n",
 					c.Name, c.Type, c.Encoding, c.Codec, c.NumValues, c.NullCount, c.NumPages,
 					c.TotalUncompressed, c.TotalCompressed)
+				if c.BlobRuns > 0 {
+					dict := ""
+					if c.BlobDict {
+						dict = ", shared dict"
+					}
+					fmt.Fprintf(&b, "  %-20s   blob region: %d->%d bytes in %d runs%s\n",
+						"", c.BlobUncompressed, c.BlobCompressed, c.BlobRuns, dict)
+				}
+			}
+			if info.NumDicts > 0 {
+				fmt.Fprintf(&b, "dicts:   %d (%d uncompressed bytes)\n", info.NumDicts, info.DictUncompressed)
 			}
 			if len(info.KeyValue) > 0 {
 				b.WriteString("metadata:\n")
