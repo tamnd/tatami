@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M5 fleet adoption. A new `convert/` subpackage reads a producer's zstd Parquet
+  shard (ami or ccrawl-cli output) and re-encodes it as tatami, the bridge that
+  lets existing crawl output gain blob separation, shared dictionaries, and
+  pruning structures without a producer change. The conversion is schema-driven:
+  it reads the Parquet leaf schema, maps each column to a tatami logical type,
+  and applies overridable heuristics (separate a body column into the blob
+  region, hint low-cardinality strings toward a shared dictionary, build a
+  membership filter on the identity columns). It streams a batch at a time so
+  memory stays bounded regardless of shard size, and round-trips nullable columns
+  and every scalar type. The format library stays Parquet-free; only this package
+  and the CLI import parquet-go. A `convert` CLI command reports the size both
+  ways. On a real Common Crawl markdown shard the tatami file is 26 percent
+  smaller than the parquet-go zstd source, with every body verified byte-for-byte.
 - M4 collection manifest. A directory of `.tatami` files is now one queryable
   dataset through a `tatami.manifest` catalog: an append-only log of tagged,
   CRC-checked edit records (ADD, REMOVE, SET_TIER) in a new self-contained
