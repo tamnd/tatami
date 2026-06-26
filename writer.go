@@ -60,6 +60,7 @@ type Writer struct {
 	builders      []*columnBuilder
 	blobCols      []*blobColAccum
 	pendingBlooms [][]byte
+	inverted      *invertedAttachment
 	meta          fileMeta
 	rowCount      uint64
 	bufRows       int
@@ -317,10 +318,37 @@ func (w *Writer) flags() uint16 {
 	if len(w.meta.dicts) > 0 {
 		fl |= FlagHasDictRegion
 	}
-	if len(w.meta.blooms) > 0 {
+	if len(w.meta.blooms) > 0 || w.meta.invert.present {
 		fl |= FlagHasIndexRegion
 	}
+	if w.meta.invert.present {
+		fl |= FlagRoleSearchSeg
+	}
 	return fl
+}
+
+// invertedAttachment carries the serialized inverted sub-region from a
+// SearchBuilder to the writer, to be emitted as index records at Close.
+type invertedAttachment struct {
+	termDict []byte
+	postings []byte
+	skips    []byte
+	numTerms uint64
+	numDocs  uint64
+}
+
+// AttachInverted hands the writer the three serialized runs of an inverted
+// sub-region, turning the file it produces into a search segment (role bit 4).
+// It must be called before Close. The runs are written into the index region and
+// addressed by the footer's inverted descriptor.
+func (w *Writer) AttachInverted(termDict, postings, skips []byte, numTerms, numDocs uint64) {
+	w.inverted = &invertedAttachment{
+		termDict: termDict,
+		postings: postings,
+		skips:    skips,
+		numTerms: numTerms,
+		numDocs:  numDocs,
+	}
 }
 
 // Close flushes the last row group, writes the footer and trailer, and patches

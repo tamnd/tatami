@@ -15,6 +15,7 @@ const (
 	secIndexDesc uint64 = 5
 	secKeyValue  uint64 = 6
 	secStats     uint64 = 7
+	secInvert    uint64 = 8
 )
 
 // footerCodecNone marks an uncompressed footer body. M0 never compresses the
@@ -108,6 +109,24 @@ type dictDesc struct {
 	length       int64
 }
 
+// invertDesc locates the inverted sub-region of a search segment: the three runs
+// (term dictionary, posting payloads, skip tables) by record offset and payload
+// length, plus the term and dense-doc counts. present is false on a document-
+// store file, which carries no inverted index. The offsets point at index records
+// (a 32-byte page header then the payload), so a reader verifies each run's CRC
+// before decoding, the same guarantee data pages get (09-search-scale.md, sec 4).
+type invertDesc struct {
+	present     bool
+	termDictOff int64
+	termDictLen int64
+	postingsOff int64
+	postingsLen int64
+	skipsOff    int64
+	skipsLen    int64
+	numTerms    uint64
+	numDocs     uint64
+}
+
 // fileMeta is everything the footer records about a file.
 type fileMeta struct {
 	schema            *Schema
@@ -115,6 +134,7 @@ type fileMeta struct {
 	blobCols          []blobColDesc
 	dicts             []dictDesc
 	blooms            []bloomDesc
+	invert            invertDesc
 	rowCount          uint64
 	kv                []kvPair
 	uncompressedTotal uint64
@@ -254,6 +274,37 @@ func decodeIndexDesc(body []byte, errp *error) []bloomDesc {
 	return out
 }
 
+func (m *fileMeta) encodeInvert() []byte {
+	var b []byte
+	b = binary.AppendUvarint(b, uint64(m.invert.termDictOff))
+	b = binary.AppendUvarint(b, uint64(m.invert.termDictLen))
+	b = binary.AppendUvarint(b, uint64(m.invert.postingsOff))
+	b = binary.AppendUvarint(b, uint64(m.invert.postingsLen))
+	b = binary.AppendUvarint(b, uint64(m.invert.skipsOff))
+	b = binary.AppendUvarint(b, uint64(m.invert.skipsLen))
+	b = binary.AppendUvarint(b, m.invert.numTerms)
+	b = binary.AppendUvarint(b, m.invert.numDocs)
+	return b
+}
+
+func decodeInvert(body []byte, errp *error) invertDesc {
+	c := &cursor{b: body}
+	d := invertDesc{present: true}
+	d.termDictOff = int64(c.uvarint())
+	d.termDictLen = int64(c.uvarint())
+	d.postingsOff = int64(c.uvarint())
+	d.postingsLen = int64(c.uvarint())
+	d.skipsOff = int64(c.uvarint())
+	d.skipsLen = int64(c.uvarint())
+	d.numTerms = c.uvarint()
+	d.numDocs = c.uvarint()
+	if c.err != nil {
+		*errp = c.err
+		return invertDesc{}
+	}
+	return d
+}
+
 func (m *fileMeta) encodeKeyValue() []byte {
 	var b []byte
 	b = binary.AppendUvarint(b, uint64(len(m.kv)))
@@ -291,6 +342,9 @@ func (m *fileMeta) encodeFooter() []byte {
 	}
 	if len(m.blooms) > 0 {
 		appendSection(secIndexDesc, m.encodeIndexDesc())
+	}
+	if m.invert.present {
+		appendSection(secInvert, m.encodeInvert())
 	}
 	appendSection(secKeyValue, m.encodeKeyValue())
 	appendSection(secStats, m.encodeStats())
@@ -404,6 +458,8 @@ func decodeFooter(raw []byte) (*fileMeta, error) {
 			m.dicts = decodeDictDesc(body, &c.err)
 		case secIndexDesc:
 			m.blooms = decodeIndexDesc(body, &c.err)
+		case secInvert:
+			m.invert = decodeInvert(body, &c.err)
 		case secKeyValue:
 			m.kv = decodeKeyValue(body, &c.err)
 		case secStats:
