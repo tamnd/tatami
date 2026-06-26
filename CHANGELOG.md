@@ -8,6 +8,33 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M9 search-only segments and scale to a hundred thousand shards. A search
+  segment can now drop the document body it never serves and keep only what a
+  result row shows. `NewSearchBuilderWith(SearchBuilderOptions{Snippet: true})`
+  builds a search-only segment whose forward store carries a short precomputed
+  lead excerpt (`makeSnippet`, `DefaultSnippetRunes` of 200) in place of the body
+  blob; the only column that changes is the variable slot, so a reader tells the
+  two shapes apart by its type (`SearchSegment.SnippetOnly`) and the inverted
+  index is untouched, which makes retrieval byte-identical to a full-document
+  segment. `MergeSegments` derives the output shape from its inputs and refuses to
+  mix a snippet segment with a full-document one. On the production ccrawl shard
+  the search-only segment is 46.26 MiB against the full-document segment's 80.94
+  MiB, 42.8 percent smaller, with retrieval proven identical. An `Aggregator`
+  (`OpenAggregator`, `Search`) is the tree-of-brokers tier above the leaf
+  `Cluster`: it fans a query out to many leaf brokers concurrently, scores every
+  leaf against fleet-wide statistics summed across the leaves (`fleetStats`
+  satisfying `search.GlobalStats`, driven through `RouteWith`/`SearchWith`), and
+  merges the leaves' partial top-k lists (`mergeLeafResults`) into one fleet-wide
+  top-k that dedups a re-crawled page by stable doc_id and is byte-identical to a
+  single broker over every shard. The per-shard over-fetch in `SearchWith` is now
+  an unconditional `k*2` rather than gated on the shard count, so a single-shard
+  leaf surfaces the tie candidates the fleet merge ranks against, which is what
+  makes the cross-leaf merge exact. On the real shard split into 254 shards over 8
+  leaves, the warm fan-out keyword p99 is 1.63 ms; a single-root merge over a
+  hundred thousand shards' worth of leaves costs 12.37 ms, and a tree of
+  aggregators with a 64-way fan-out clears it in two tiers at 271 us, projecting a
+  fleet p99 of 1.29 ms at a hundred thousand shards, inside the ten millisecond
+  goal. Design in Spec 2066 `13-search-only-and-scale.md`; implementation note 10.
 - M8 distributed serving at shard scale. A broker now serves a large fan of cold
   shards behind one query, visiting only the shards that can contribute and
   keeping a bounded working set open, with an exact cross-shard top-k. Global
