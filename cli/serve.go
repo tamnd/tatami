@@ -65,7 +65,7 @@ func newServeCmd() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "serving %d docs across %d shards on %s (cache=%d, max-in-flight=%d)\n",
 				cluster.NumDocs(), cluster.NumShards(), addr, cacheSize, maxInFlight)
 
-			return runServer(cmd.Context(), cmd, addr, srv.Handler())
+			return runServer(cmd.Context(), cmd, addr, srv)
 		},
 	}
 	cmd.Flags().StringVar(&addr, "addr", ":8080", "address to listen on")
@@ -98,10 +98,13 @@ func segmentPaths(root string) ([]string, error) {
 
 // runServer starts the HTTP server and blocks until the context is canceled or an
 // interrupt arrives, then drains in-flight requests with a bounded grace period.
-// The graceful shutdown lets admitted queries finish before the cluster closes, so
-// a reader's file read never races the close.
-func runServer(ctx context.Context, cmd *cobra.Command, addr string, h http.Handler) error {
-	hs := &http.Server{Addr: addr, Handler: h}
+// The graceful shutdown stops accepting requests, waits for the handlers to return,
+// then drains the search workers those handlers spawned before returning to the
+// caller, whose deferred cluster.Close runs only after the drain. That ordering
+// keeps a worker's in-flight segment read from racing the file close, even for a
+// query that already tripped its deadline.
+func runServer(ctx context.Context, cmd *cobra.Command, addr string, srv *tatami.Server) error {
+	hs := &http.Server{Addr: addr, Handler: srv.Handler()}
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -117,11 +120,17 @@ func runServer(ctx context.Context, cmd *cobra.Command, addr string, h http.Hand
 
 	select {
 	case err := <-errc:
+		// The listener stopped on its own (a bind failure or an unexpected close).
+		// Drain any workers a request started before handing control back to the
+		// caller's cluster.Close.
+		srv.Drain()
 		return err
 	case <-ctx.Done():
 		fmt.Fprintln(cmd.OutOrStdout(), "shutting down")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return hs.Shutdown(shutCtx)
+		err := hs.Shutdown(shutCtx)
+		srv.Drain()
+		return err
 	}
 }

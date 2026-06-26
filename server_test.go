@@ -287,6 +287,40 @@ func TestServerAdmissionSheds(t *testing.T) {
 	}
 }
 
+// TestServerDrainAwaitsWorkers checks the fix that makes shutdown safe: a request
+// that trips the deadline returns 504 while its worker keeps running, and the
+// worker, not the handler, frees the admission slot. Drain must block until every
+// such worker has finished, so after it returns no slot is still held and the
+// caller can close the cluster without racing an in-flight segment read. Run with
+// -race together with the deferred Close, this exercises that the close does not
+// race a worker. The tiny timeout makes the deadline fire on essentially every
+// request, so the workers outlive their handlers.
+func TestServerDrainAwaitsWorkers(t *testing.T) {
+	c := serverCorpus(t)
+	defer c.Close()
+	srv := NewServer(c, ServerOptions{MaxInFlight: 4, Timeout: time.Nanosecond})
+	h := srv.Handler()
+
+	for i := 0; i < 12; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/search?q=common", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		// Each request finishes (200), trips the 1ns deadline (504), or is shed
+		// (503) because earlier workers still hold their slots past their handlers,
+		// which is the property under test: the slot bounds work, not connections.
+		switch rec.Code {
+		case http.StatusOK, http.StatusGatewayTimeout, http.StatusServiceUnavailable:
+		default:
+			t.Fatalf("request %d returned %d, want 200, 503, or 504", i, rec.Code)
+		}
+	}
+
+	srv.Drain()
+	if held := len(srv.sem); held != 0 {
+		t.Fatalf("after Drain, %d admission slots still held, want 0", held)
+	}
+}
+
 // TestServerTimeout checks a query that overruns the deadline returns 504 and the
 // slot is released. It uses a deliberately tiny timeout against the real broker;
 // the search either finishes (200) or trips the deadline (504), and either way the

@@ -22,16 +22,22 @@ package tatami
 // disk read; without a bound, one slow shard ties up an admission slot and a
 // goroutine indefinitely. Each request carries a timeout: the search runs on a
 // worker goroutine and the handler waits on whichever finishes first, the search
-// or the deadline, returning 504 on the deadline so the slot is accounted for and
-// the client is not left hanging. The worker is left to finish and release its own
-// resources rather than being killed mid-read, which the immutable served segment
-// makes safe.
+// or the deadline, returning 504 on the deadline so the client is not left
+// hanging. The worker is left to finish and release its own resources rather than
+// being killed mid-read, which the immutable served segment makes safe. Because
+// the worker, not the handler, owns the search, it is also the worker that frees
+// the admission slot: the slot stays held until the search actually finishes, so
+// the cap bounds concurrent work and not just concurrent connections, even when a
+// flood of requests all trip the deadline. A WaitGroup tracks the live workers so
+// a graceful shutdown can wait for them to drain before the cluster is closed,
+// which keeps a timed-out worker's in-flight segment read from racing the close.
 
 import (
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -80,11 +86,16 @@ type Server struct {
 	maxK     int
 	defaultK int
 
+	// workers tracks the search goroutines still running, so Drain can wait for
+	// them before the caller closes the cluster.
+	workers sync.WaitGroup
+
 	// Counters, read by /stats. Atomic so the stats handler never contends with
 	// the query handlers.
 	total    atomic.Uint64 // requests admitted to the search path
 	rejected atomic.Uint64 // requests turned away by admission (503)
 	timedOut atomic.Uint64 // requests that hit the deadline (504)
+	canceled atomic.Uint64 // requests the client disconnected before completion (408)
 	failed   atomic.Uint64 // requests whose search returned an error (500)
 }
 
@@ -183,10 +194,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Admission: take a slot or shed the request. A non-blocking send keeps the
-	// reject path instant rather than letting the arrival queue without bound.
+	// reject path instant rather than letting the arrival queue without bound. The
+	// slot is freed by the worker below when the search finishes, not when this
+	// handler returns, so a request that trips the deadline keeps occupying the cap
+	// until its search actually completes.
 	select {
 	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
 	default:
 		s.rejected.Add(1)
 		writeError(w, http.StatusServiceUnavailable, "server at capacity, retry shortly")
@@ -201,14 +214,21 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		took  time.Duration
 	}
 	done := make(chan result, 1)
+	s.workers.Add(1)
 	go func() {
+		// The worker owns the slot and the WaitGroup token: it releases both when
+		// the search returns, whether or not the handler is still waiting. The done
+		// channel is buffered, so the send never blocks even after a deadline or a
+		// client disconnect moved the handler on.
+		defer s.workers.Done()
+		defer func() { <-s.sem }()
 		start := time.Now()
 		res, st, err := s.cluster.Search(q, k)
 		done <- result{res: res, stats: st, err: err, took: time.Since(start)}
 	}()
 
 	// The request context cancels if the client disconnects; the timer bounds a
-	// stalled search. Whichever fires first frees the admission slot.
+	// stalled search. Whichever fires first ends the wait; the worker frees the slot.
 	timer := time.NewTimer(s.timeout)
 	defer timer.Stop()
 	select {
@@ -223,8 +243,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		s.timedOut.Add(1)
 		writeError(w, http.StatusGatewayTimeout, "query exceeded the deadline")
 	case <-r.Context().Done():
+		s.canceled.Add(1)
 		writeError(w, http.StatusRequestTimeout, "client closed the request")
 	}
+}
+
+// Drain waits for every in-flight search worker to finish. A server's caller
+// invokes it after the HTTP server has stopped accepting requests and before it
+// closes the cluster, so a worker still reading a segment never races the close.
+func (s *Server) Drain() {
+	s.workers.Wait()
 }
 
 // render turns the broker's results and stats into the wire response.
@@ -283,6 +311,7 @@ type statsResponse struct {
 	Total       uint64 `json:"total"`
 	Rejected    uint64 `json:"rejected"`
 	TimedOut    uint64 `json:"timed_out"`
+	Canceled    uint64 `json:"canceled"`
 	Failed      uint64 `json:"failed"`
 }
 
@@ -297,6 +326,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		Total:       s.total.Load(),
 		Rejected:    s.rejected.Load(),
 		TimedOut:    s.timedOut.Load(),
+		Canceled:    s.canceled.Load(),
 		Failed:      s.failed.Load(),
 	})
 }
