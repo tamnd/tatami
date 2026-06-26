@@ -208,18 +208,22 @@ func (w *Writer) writeChunk(colID int, col Column) (chunkMeta, error) {
 			present = col.Valid[s : s+cnt]
 		}
 		bitmap, nullCount := buildValidityMask(present, cnt)
-		payload := make([]byte, 0, len(bitmap)+cnt)
+		enc, valbytes := encodePageValues(f.Type, col, s, cnt, present)
+		payload := make([]byte, 0, len(bitmap)+len(valbytes))
 		payload = append(payload, bitmap...)
-		payload = encodePlain(payload, f.Type, col, s, cnt, present)
+		payload = append(payload, valbytes...)
 		uncompressed := len(payload)
 		compressed := w.blockc.Compress(nil, payload)
 		var flags uint8
 		if bitmap != nil {
 			flags |= pageFlagNullsPresent
 		}
+		if s == 0 {
+			cm.encoding = enc
+		}
 		ph := pageHeader{
 			kind:             PageData,
-			encoding:         EncPlain,
+			encoding:         enc,
 			codec:            Codec(w.blockc.ID()),
 			flags:            flags,
 			numValues:        uint32(cnt),

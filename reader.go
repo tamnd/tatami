@@ -186,7 +186,7 @@ func (r *Reader) ReadColumn(group, col int) (Column, error) {
 			bitmap = plain[:bl]
 			body = plain[bl:]
 		}
-		vals, err := decodePlain(f.Type, body, num, bitmap)
+		vals, err := decodePageValues(f.Type, ph.encoding, body, num, bitmap)
 		if err != nil {
 			return Column{}, err
 		}
