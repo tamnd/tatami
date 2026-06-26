@@ -17,6 +17,7 @@ type Reader struct {
 	size      int64
 	header    *Header
 	meta      *fileMeta
+	footerCRC uint32 // CRC32C of the footer, the manifest's per-member integrity handle
 	resolvers map[int]*blobResolver
 }
 
@@ -66,7 +67,7 @@ func Open(r io.ReaderAt, size int64) (*Reader, error) {
 	if err := meta.schema.validate(); err != nil {
 		return nil, err
 	}
-	return &Reader{r: r, size: size, header: h, meta: meta, resolvers: map[int]*blobResolver{}}, nil
+	return &Reader{r: r, size: size, header: h, meta: meta, footerCRC: footerCRC, resolvers: map[int]*blobResolver{}}, nil
 }
 
 // OpenFile opens path and returns a Reader plus the underlying file. The caller

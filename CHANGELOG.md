@@ -8,6 +8,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M4 collection manifest. A directory of `.tatami` files is now one queryable
+  dataset through a `tatami.manifest` catalog: an append-only log of tagged,
+  CRC-checked edit records (ADD, REMOVE, SET_TIER) in a new self-contained
+  `manifest/` subpackage, replayed on open to rebuild the live member set and
+  compacted from that set when the log grows. A torn tail from a crash mid-append
+  is detected by its CRC and discarded, so replay keeps the last consistent
+  prefix. Each member carries its key range and a per-column zone rollup, so the
+  root `Collection` prunes across files in memory before opening any of them,
+  reusing M3's three-valued evaluator through a `memberView` adapter: `Lookup`
+  over a sorted disjoint collection opens exactly one file, and a predicate
+  `Scan` skips every shard the zone rollup rules out. `Merge` decodes a set of
+  members, re-encodes them into one fresh shard through the normal writer, and
+  swaps the manifest atomically in one batch. A `collection` CLI command (alias
+  `col`) adds, lists, and compacts. Members default to a deterministic
+  path-and-footer-CRC identity when the writer left the header UUID zero, so the
+  file format stays byte-stable.
 - M3 indexing. The file now carries the pruning structures a selective read
   needs so its cost tracks the size of the answer, not the size of the data.
   Every column chunk records a min/max zone map, so a predicate scan skips whole
