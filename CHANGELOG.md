@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-26
+
+The first release. tatami ships as a columnar single-file format and a search
+engine in one container, proven on real Common Crawl data: keyword queries
+return with a p99 of 237 microseconds on one segment and 465 microseconds served
+across twenty, more than twenty times under the ten-millisecond goal. Everything
+below landed across milestones M0 through M7.
+
 ### Added
 
 - M7 tiered merge and serving at scale. A search index now scales from one file

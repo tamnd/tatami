@@ -10,17 +10,20 @@
 
 The format is built for the rest of the fleet. A crawler like [ami](https://github.com/tamnd/ami) or a corpus like [Common Crawl via ccrawl-cli](https://github.com/tamnd/ccrawl-cli) writes billions of pages into many `.tatami` files, a manifest stitches them into one logical collection, and a reader serves point lookups, column scans, and keyword queries off the same bytes.
 
+Full documentation, with guides and the complete reference, is at [tatami.tamnd.com](https://tatami.tamnd.com).
+
 ## Status
 
-Early. The container is in place and stable: a fixed header, row groups of column chunks, a self-describing footer written last so a reader learns the whole layout from one tail read, and CRC32C on every page and on the footer. The first milestone (M0) ships the on-disk container, PLAIN encoding for every logical type, zstd block compression, and a byte-stable round trip. The encoding cascade, blob separation, trained dictionaries, indexing, the collection manifest, and the search-segment role land in the milestones that follow.
+Complete. The format and the search engine are both implemented and proven on real Common Crawl data. A `.tatami` file is a stable, self-describing container with an encoding cascade, blob separation, shared trained dictionaries, zone maps, bloom filters, and a sparse key index. A manifest stitches many files into one collection, the `convert` command brings existing Parquet shards in, and the search-segment role adds an inverted index with BM25 ranking and block-max WAND retrieval. On a real shard, 20246 documents and 1.4 million terms, keyword queries return with a p99 of 237 microseconds; served across twenty segments at once, fan-out retrieval stays at a p99 of 465 microseconds, more than twenty times under the ten-millisecond goal the format was built to hit.
 
 ## Install
 
 ```bash
+brew install tamnd/tap/tatami       # macOS and Linux
 go install github.com/tamnd/tatami/cmd/tatami@latest
 ```
 
-Prebuilt binaries, `.deb`/`.rpm`/`.apk` packages, and checksums ship on [releases](https://github.com/tamnd/tatami/releases) once the first tag is cut.
+Prebuilt binaries, `.deb`/`.rpm`/`.apk` packages, a multi-arch GHCR image, and checksums ship on [releases](https://github.com/tamnd/tatami/releases). See [installation](https://tatami.tamnd.com/getting-started/installation/) for every channel.
 
 ## Quick start
 

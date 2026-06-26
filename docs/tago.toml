@@ -1,0 +1,14 @@
+title       = "tatami"
+baseURL     = "https://tatami.tamnd.com/"
+description = "tatami (畳) is a single-file columnar storage format for web-scale crawl and search. One .tatami file is a compact cold document store and a hot inverted search index behind one layout and one reader, with keyword queries that return in well under ten milliseconds."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/tatami"
+heroTitle = "One file, a corpus and its search index"
+heroLead = "tatami stores crawled documents as compressed columns and, with one header bit flipped, doubles the same file as a search segment. Convert a Parquet shard, scan it with column projection, or serve keyword queries off the same bytes in microseconds."
+heroPrimaryURL = "/getting-started/quick-start/"
+heroPrimaryText = "Get started"
