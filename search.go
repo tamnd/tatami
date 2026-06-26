@@ -19,6 +19,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/tamnd/tatami/search"
@@ -285,17 +286,55 @@ func makeSnippet(body string, maxRunes int) string {
 // SearchSegment is a read-only view of a search-segment file: the tatami reader
 // for the forward store plus the decoded inverted index for retrieval. It is the
 // served handle.
+//
+// It is safe for concurrent queries. The retrieval path (SearchTermsWith) is
+// reentrant: the WAND loop allocates its posting cursors per call and the scorer
+// is a value type, so two goroutines searching the same segment never share
+// mutable state. The stored-field path lazily caches the small display columns
+// per row group; those caches are guarded by mu, with the column read done
+// outside the lock so concurrent fetches do not serialize on I/O. Delete mutates
+// the live bitset in place and is therefore not safe to run while queries are in
+// flight; a served segment is treated as immutable (14-serving.md).
 type SearchSegment struct {
-	r            *Reader
-	f            *os.File
-	inv          *search.Inverted
-	groupFirst   []uint64 // firstRow of each row group, for docID -> group mapping
-	snippet      bool     // true when column 3 is a snippet string, not a body blob
+	r          *Reader
+	f          *os.File
+	inv        *search.Inverted
+	groupFirst []uint64 // firstRow of each row group, for docID -> group mapping
+	snippet    bool     // true when column 3 is a snippet string, not a body blob
+
+	mu           sync.RWMutex
 	urlCache     map[int][]string
 	titleCache   map[int][]string
 	snippetCache map[int][]string
 	idCache      map[int][]string  // doc_id column per group, for cross-segment dedup
 	docIndex     map[string]uint32 // global doc_id -> dense docID, built lazily for deletes
+}
+
+// groupStrings returns the string column col for row group g, reading it once and
+// caching it. The read happens outside the lock so concurrent first-touches of
+// different groups do not serialize, and a lost race on the same group just
+// discards the duplicate read. After warmup every call is a read-locked map hit,
+// so thousands of concurrent fetches against one segment run without contending.
+func (s *SearchSegment) groupStrings(cache map[int][]string, g, col int) ([]string, error) {
+	s.mu.RLock()
+	v, ok := cache[g]
+	s.mu.RUnlock()
+	if ok {
+		return v, nil
+	}
+	c, err := s.r.ReadColumn(g, col)
+	if err != nil {
+		return nil, err
+	}
+	data := c.Data.([]string)
+	s.mu.Lock()
+	if existing, ok := cache[g]; ok {
+		data = existing
+	} else {
+		cache[g] = data
+	}
+	s.mu.Unlock()
+	return data, nil
 }
 
 // SearchResult is one ranked hit: the dense docID, the stable global doc_id, the
@@ -502,37 +541,22 @@ func (s *SearchSegment) storedFields(docID uint32) (stored, error) {
 		return stored{}, fmt.Errorf("tatami: docID %d out of range", docID)
 	}
 	off := int(uint64(docID) - s.groupFirst[g])
-	urls, ok := s.urlCache[g]
-	if !ok {
-		col, err := s.r.ReadColumn(g, 1) // url
-		if err != nil {
-			return stored{}, err
-		}
-		urls = col.Data.([]string)
-		s.urlCache[g] = urls
+	urls, err := s.groupStrings(s.urlCache, g, 1) // url
+	if err != nil {
+		return stored{}, err
 	}
-	titles, ok := s.titleCache[g]
-	if !ok {
-		col, err := s.r.ReadColumn(g, 2) // title
-		if err != nil {
-			return stored{}, err
-		}
-		titles = col.Data.([]string)
-		s.titleCache[g] = titles
+	titles, err := s.groupStrings(s.titleCache, g, 2) // title
+	if err != nil {
+		return stored{}, err
 	}
 	if off < 0 || off >= len(urls) {
 		return stored{}, fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)
 	}
 	out := stored{url: urls[off], title: titles[off]}
 	if s.snippet {
-		snips, ok := s.snippetCache[g]
-		if !ok {
-			col, err := s.r.ReadColumn(g, colVariable) // snippet
-			if err != nil {
-				return stored{}, err
-			}
-			snips = col.Data.([]string)
-			s.snippetCache[g] = snips
+		snips, err := s.groupStrings(s.snippetCache, g, colVariable) // snippet
+		if err != nil {
+			return stored{}, err
 		}
 		if off < len(snips) {
 			out.snippet = snips[off]
@@ -550,14 +574,9 @@ func (s *SearchSegment) globalDocID(docID uint32) (string, error) {
 		return "", fmt.Errorf("tatami: docID %d out of range", docID)
 	}
 	off := int(uint64(docID) - s.groupFirst[g])
-	ids, ok := s.idCache[g]
-	if !ok {
-		col, err := s.r.ReadColumn(g, 0) // doc_id
-		if err != nil {
-			return "", err
-		}
-		ids = col.Data.([]string)
-		s.idCache[g] = ids
+	ids, err := s.groupStrings(s.idCache, g, 0) // doc_id
+	if err != nil {
+		return "", err
 	}
 	if off < 0 || off >= len(ids) {
 		return "", fmt.Errorf("tatami: docID %d offset out of range in group %d", docID, g)

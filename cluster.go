@@ -25,33 +25,23 @@ package tatami
 // every shard.
 
 import (
-	"container/list"
 	"sort"
-	"sync"
 
 	"github.com/tamnd/tatami/search"
 )
 
 // Cluster serves many search-segment files as one logical index, routing each
 // query to the shards that can contribute and keeping only a bounded working set
-// of segments open. It is not safe for concurrent queries: a segment's lazy
-// column caches and the open-segment LRU are mutated on the query path and are
-// guarded by one mutex, so queries serialize. Fleet-level concurrency is a
-// front-end concern that runs one Cluster per worker (12-distributed-serving.md).
+// of segments open. It is safe for concurrent queries: the open-segment working
+// set lives in a concurrent reference-counted cache (segCache) whose lock guards
+// only the residency bookkeeping, never the WAND loop or a column read, and the
+// segments it serves are reentrant for read. So a server can drive one Cluster
+// from thousands of goroutines and they route, prune, and score in parallel
+// rather than queuing behind one lock (14-serving.md).
 type Cluster struct {
 	paths   []string
 	routing *search.RoutingIndex
-
-	mu    sync.Mutex
-	open  map[int]*list.Element // shard id -> element in lru
-	lru   *list.List            // front = most recently used; value is *openShard
-	limit int
-}
-
-// openShard is one resident segment in the LRU.
-type openShard struct {
-	shard int
-	seg   *SearchSegment
+	cache   *segCache
 }
 
 // ClusterOptions tunes a Cluster. CacheSize caps how many segments stay open at
@@ -91,17 +81,11 @@ func OpenCluster(paths []string, opts ClusterOptions) (*Cluster, error) {
 // re-scanning every shard. The routing index must have been built over the same
 // paths in the same order, since shard ids are path indices.
 func OpenClusterWithRouting(paths []string, routing *search.RoutingIndex, opts ClusterOptions) *Cluster {
-	limit := opts.CacheSize
-	if limit <= 0 {
-		limit = DefaultCacheSize
-	}
-	return &Cluster{
-		paths:   paths,
-		routing: routing,
-		open:    make(map[int]*list.Element),
-		lru:     list.New(),
-		limit:   limit,
-	}
+	c := &Cluster{paths: paths, routing: routing}
+	c.cache = newSegCache(opts.CacheSize, func(shard int) (*SearchSegment, error) {
+		return OpenSearch(paths[shard])
+	})
+	return c
 }
 
 // Routing exposes the routing index, for stats and for persisting the sidecar.
@@ -115,54 +99,11 @@ func (c *Cluster) NumShards() int { return len(c.paths) }
 func (c *Cluster) NumDocs() int { return c.routing.NumDocs() }
 
 // Close closes every segment still open in the cache.
-func (c *Cluster) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var first error
-	for e := c.lru.Front(); e != nil; e = e.Next() {
-		if err := e.Value.(*openShard).seg.Close(); err != nil && first == nil {
-			first = err
-		}
-	}
-	c.open = make(map[int]*list.Element)
-	c.lru.Init()
-	return first
-}
+func (c *Cluster) Close() error { return c.cache.closeAll() }
 
-// getSegment returns the open segment for a shard, opening it and evicting the
-// least recently used segment if the cache is full. The caller holds c.mu.
-func (c *Cluster) getSegment(shard int) (*SearchSegment, error) {
-	if e, ok := c.open[shard]; ok {
-		c.lru.MoveToFront(e)
-		return e.Value.(*openShard).seg, nil
-	}
-	seg, err := OpenSearch(c.paths[shard])
-	if err != nil {
-		return nil, err
-	}
-	for c.lru.Len() >= c.limit {
-		back := c.lru.Back()
-		if back == nil {
-			break
-		}
-		os := back.Value.(*openShard)
-		c.lru.Remove(back)
-		delete(c.open, os.shard)
-		if err := os.seg.Close(); err != nil {
-			_ = seg.Close()
-			return nil, err
-		}
-	}
-	c.open[shard] = c.lru.PushFront(&openShard{shard: shard, seg: seg})
-	return seg, nil
-}
-
-// CacheLen reports how many segments are currently open, for tests and metrics.
-func (c *Cluster) CacheLen() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lru.Len()
-}
+// CacheLen reports how many segments are currently resident, for tests and
+// metrics.
+func (c *Cluster) CacheLen() int { return c.cache.len() }
 
 // QueryStats reports how a routed query was answered: how many shards held a query
 // term, how many the broker actually visited before the bound pruned the rest, and
@@ -195,24 +136,22 @@ func (c *Cluster) QueryWith(query string, k int, stats search.GlobalStats) ([]Cl
 	bounds := c.routing.RouteWith(terms, stats)
 	qstats := QueryStats{Candidates: len(bounds)}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	var cands []ClusterHit
 	th := newMinHeap(k)
 	for _, sb := range bounds {
 		if th.full() && sb.Bound < th.min() {
 			break
 		}
-		seg, err := c.getSegment(int(sb.Shard))
+		h, err := c.cache.acquire(int(sb.Shard))
 		if err != nil {
 			return nil, qstats, err
 		}
 		qstats.Visited++
-		for _, h := range seg.SearchTermsWith(terms, k, stats) {
-			cands = append(cands, ClusterHit{Shard: int(sb.Shard), Doc: uint32(h.Doc), Score: float32(h.Score)})
-			th.push(h.Score)
+		for _, hit := range h.seg.SearchTermsWith(terms, k, stats) {
+			cands = append(cands, ClusterHit{Shard: int(sb.Shard), Doc: uint32(hit.Doc), Score: float32(hit.Score)})
+			th.push(hit.Score)
 		}
+		c.cache.release(h)
 	}
 	if th.full() {
 		qstats.Threshold = float32(th.min())
@@ -261,29 +200,28 @@ func (c *Cluster) SearchWith(query string, k int, stats search.GlobalStats) ([]S
 	// exactly as a single broker over every shard would (13-search-only-and-scale.md).
 	perShard := k * 2
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	best := make(map[string]clusterCand)
 	for _, sb := range bounds {
 		if th, ok := kthDistinct(best, k); ok && sb.Bound < th {
 			break
 		}
-		seg, err := c.getSegment(int(sb.Shard))
+		h, err := c.cache.acquire(int(sb.Shard))
 		if err != nil {
 			return nil, qstats, err
 		}
 		qstats.Visited++
-		for _, h := range seg.SearchTermsWith(terms, perShard, stats) {
-			id, err := seg.globalDocID(uint32(h.Doc))
+		for _, hit := range h.seg.SearchTermsWith(terms, perShard, stats) {
+			id, err := h.seg.globalDocID(uint32(hit.Doc))
 			if err != nil {
+				c.cache.release(h)
 				return nil, qstats, err
 			}
-			cand := clusterCand{score: float32(h.Score), shard: int(sb.Shard), dense: uint32(h.Doc), id: id}
+			cand := clusterCand{score: float32(hit.Score), shard: int(sb.Shard), dense: uint32(hit.Doc), id: id}
 			if cur, ok := best[id]; !ok || cand.better(cur) {
 				best[id] = cand
 			}
 		}
+		c.cache.release(h)
 	}
 	if th, ok := kthDistinct(best, k); ok {
 		qstats.Threshold = float32(th)
@@ -300,11 +238,12 @@ func (c *Cluster) SearchWith(query string, k int, stats search.GlobalStats) ([]S
 
 	out := make([]SearchResult, 0, len(ranked))
 	for _, rc := range ranked {
-		seg, err := c.getSegment(rc.shard)
+		h, err := c.cache.acquire(rc.shard)
 		if err != nil {
 			return nil, qstats, err
 		}
-		f, err := seg.storedFields(rc.dense)
+		f, err := h.seg.storedFields(rc.dense)
+		c.cache.release(h)
 		if err != nil {
 			return nil, qstats, err
 		}
