@@ -13,10 +13,11 @@ import (
 // footer first (one tail read for a remote file), then reads only the column
 // chunks a caller asks for.
 type Reader struct {
-	r      io.ReaderAt
-	size   int64
-	header *Header
-	meta   *fileMeta
+	r         io.ReaderAt
+	size      int64
+	header    *Header
+	meta      *fileMeta
+	resolvers map[int]*blobResolver
 }
 
 // Open parses a file accessible through r whose total length is size.
@@ -65,7 +66,7 @@ func Open(r io.ReaderAt, size int64) (*Reader, error) {
 	if err := meta.schema.validate(); err != nil {
 		return nil, err
 	}
-	return &Reader{r: r, size: size, header: h, meta: meta}, nil
+	return &Reader{r: r, size: size, header: h, meta: meta, resolvers: map[int]*blobResolver{}}, nil
 }
 
 // OpenFile opens path and returns a Reader plus the underlying file. The caller
@@ -143,6 +144,9 @@ func (r *Reader) ReadColumn(group, col int) (Column, error) {
 		return Column{}, fmt.Errorf("tatami: column %d missing in group %d", col, group)
 	}
 	f := r.meta.schema.Fields[col]
+	if separatedBlob(f) {
+		return r.readSeparatedBlobColumn(group, col, cm)
+	}
 	out := emptyTyped(f.Type)
 	anyNull := cm.nullCount > 0
 	var valid []bool

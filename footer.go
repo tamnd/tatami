@@ -50,10 +50,38 @@ type kvPair struct {
 	key, value string
 }
 
+// blobRunDesc is the footer entry for one packed-and-compressed blob run. The
+// reader reads compressedSize bytes at recordOffset+PageHeaderSize, decompresses
+// to uncompressedSize, and slices out one of the run's numValues values.
+type blobRunDesc struct {
+	recordOffset     int64
+	compressedSize   int64
+	uncompressedSize int64
+	numValues        int
+}
+
+// blobColDesc is the footer entry for one separated blob column: which column it
+// belongs to, the dictionary it shares (1-based into fileMeta.dicts, 0 for
+// none), the codec its run records use, and the run directory in order.
+type blobColDesc struct {
+	columnID    int
+	dictIndex   int
+	recordCodec Codec
+	runs        []blobRunDesc
+}
+
+// dictDesc is the footer entry for one dictionary record in the dict region.
+type dictDesc struct {
+	recordOffset int64
+	length       int64
+}
+
 // fileMeta is everything the footer records about a file.
 type fileMeta struct {
 	schema            *Schema
 	groups            []rowGroupMeta
+	blobCols          []blobColDesc
+	dicts             []dictDesc
 	rowCount          uint64
 	kv                []kvPair
 	uncompressedTotal uint64
@@ -101,6 +129,34 @@ func (m *fileMeta) encodeRowGroups() []byte {
 	return b
 }
 
+func (m *fileMeta) encodeBlobDesc() []byte {
+	var b []byte
+	b = binary.AppendUvarint(b, uint64(len(m.blobCols)))
+	for _, c := range m.blobCols {
+		b = binary.AppendUvarint(b, uint64(c.columnID))
+		b = binary.AppendUvarint(b, uint64(c.dictIndex))
+		b = append(b, byte(c.recordCodec))
+		b = binary.AppendUvarint(b, uint64(len(c.runs)))
+		for _, r := range c.runs {
+			b = binary.AppendUvarint(b, uint64(r.recordOffset))
+			b = binary.AppendUvarint(b, uint64(r.compressedSize))
+			b = binary.AppendUvarint(b, uint64(r.uncompressedSize))
+			b = binary.AppendUvarint(b, uint64(r.numValues))
+		}
+	}
+	return b
+}
+
+func (m *fileMeta) encodeDictDesc() []byte {
+	var b []byte
+	b = binary.AppendUvarint(b, uint64(len(m.dicts)))
+	for _, d := range m.dicts {
+		b = binary.AppendUvarint(b, uint64(d.recordOffset))
+		b = binary.AppendUvarint(b, uint64(d.length))
+	}
+	return b
+}
+
 func (m *fileMeta) encodeKeyValue() []byte {
 	var b []byte
 	b = binary.AppendUvarint(b, uint64(len(m.kv)))
@@ -130,6 +186,12 @@ func (m *fileMeta) encodeFooter() []byte {
 	}
 	appendSection(secSchema, m.encodeSchema())
 	appendSection(secRowGroups, m.encodeRowGroups())
+	if len(m.blobCols) > 0 {
+		appendSection(secBlobDesc, m.encodeBlobDesc())
+	}
+	if len(m.dicts) > 0 {
+		appendSection(secDictDesc, m.encodeDictDesc())
+	}
 	appendSection(secKeyValue, m.encodeKeyValue())
 	appendSection(secStats, m.encodeStats())
 	return out
@@ -219,6 +281,10 @@ func decodeFooter(raw []byte) (*fileMeta, error) {
 			m.schema = decodeSchema(body, &c.err)
 		case secRowGroups:
 			m.groups = decodeRowGroups(body, &c.err)
+		case secBlobDesc:
+			m.blobCols = decodeBlobDesc(body, &c.err)
+		case secDictDesc:
+			m.dicts = decodeDictDesc(body, &c.err)
 		case secKeyValue:
 			m.kv = decodeKeyValue(body, &c.err)
 		case secStats:
@@ -290,6 +356,51 @@ func decodeRowGroups(body []byte, errp *error) []rowGroupMeta {
 		return nil
 	}
 	return groups
+}
+
+func decodeBlobDesc(body []byte, errp *error) []blobColDesc {
+	c := &cursor{b: body}
+	nc := c.uvarint()
+	cols := make([]blobColDesc, 0, nc)
+	for ci := uint64(0); ci < nc && c.err == nil; ci++ {
+		bc := blobColDesc{}
+		bc.columnID = int(c.uvarint())
+		bc.dictIndex = int(c.uvarint())
+		bc.recordCodec = Codec(c.byte1())
+		nr := c.uvarint()
+		bc.runs = make([]blobRunDesc, 0, nr)
+		for ri := uint64(0); ri < nr && c.err == nil; ri++ {
+			r := blobRunDesc{}
+			r.recordOffset = int64(c.uvarint())
+			r.compressedSize = int64(c.uvarint())
+			r.uncompressedSize = int64(c.uvarint())
+			r.numValues = int(c.uvarint())
+			bc.runs = append(bc.runs, r)
+		}
+		cols = append(cols, bc)
+	}
+	if c.err != nil {
+		*errp = c.err
+		return nil
+	}
+	return cols
+}
+
+func decodeDictDesc(body []byte, errp *error) []dictDesc {
+	c := &cursor{b: body}
+	n := c.uvarint()
+	dicts := make([]dictDesc, 0, n)
+	for i := uint64(0); i < n && c.err == nil; i++ {
+		d := dictDesc{}
+		d.recordOffset = int64(c.uvarint())
+		d.length = int64(c.uvarint())
+		dicts = append(dicts, d)
+	}
+	if c.err != nil {
+		*errp = c.err
+		return nil
+	}
+	return dicts
 }
 
 func decodeKeyValue(body []byte, errp *error) []kvPair {

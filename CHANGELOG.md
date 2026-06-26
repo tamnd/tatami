@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M2 blob region and shared dictionaries. BLOBREF columns are separated out of
+  the row groups into a trailing blob region of packed runs, so a large body
+  compresses against the whole file instead of one page at a time. A new `blob/`
+  subpackage owns the run layout and the ordinal-to-run directory; the column
+  chunk keeps only a validity bitmap, and the reader resolves each present row to
+  its run with no per-row offset stored. A per-column raw-dictionary zstd codec
+  (ZSTD_DICT) is trained and kept only when it earns back its own stored size, so
+  a small-record column takes the dictionary win while a large self-similar body
+  stays on plain zstd. On a markdown sample the separated file lands at about two
+  thirds the inline size. The footer gained blob and dict descriptor sections,
+  the header gained the blob and dict region flags, and `inspect` reports the
+  blob bytes and dictionaries.
 - M1 encoding cascade. A new `encoding/` subpackage holds the physical per-page
   encoders: BITPACK_FOR, DELTA, RLE, GROUPVARINT, and PFORDELTA for the integer
   family, and BITMAP for bool. A greedy per-page sampler takes PLAIN as the floor

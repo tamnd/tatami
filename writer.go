@@ -24,9 +24,13 @@ type WriterOptions struct {
 	RowGroupMaxBytes int
 	PageMaxValues    int
 	PageSizeHint     int
-	UUID             [16]byte
-	CreatedMillis    uint64
-	CreatorID        uint32
+	// BlobRunTargetBytes caps the raw size of one packed blob run. Larger runs
+	// compress better; smaller runs cost less to decode for a single-value read
+	// and make a shared dictionary more likely to pay off. Zero takes the default.
+	BlobRunTargetBytes int
+	UUID               [16]byte
+	CreatedMillis      uint64
+	CreatorID          uint32
 }
 
 func (o *WriterOptions) withDefaults() {
@@ -38,6 +42,9 @@ func (o *WriterOptions) withDefaults() {
 	}
 	if o.PageMaxValues <= 0 {
 		o.PageMaxValues = DefaultPageMaxValues
+	}
+	if o.BlobRunTargetBytes <= 0 {
+		o.BlobRunTargetBytes = blobRunTargetBytes
 	}
 }
 
@@ -51,6 +58,7 @@ type Writer struct {
 	opts     WriterOptions
 	blockc   codec.Codec
 	builders []*columnBuilder
+	blobCols []*blobColAccum
 	meta     fileMeta
 	rowCount uint64
 	bufRows  int
@@ -78,8 +86,12 @@ func NewWriter(w io.WriterAt, schema *Schema, opts WriterOptions) (*Writer, erro
 		blockc: bc,
 	}
 	tw.builders = make([]*columnBuilder, len(schema.Fields))
+	tw.blobCols = make([]*blobColAccum, len(schema.Fields))
 	for i, f := range schema.Fields {
 		tw.builders[i] = newColumnBuilder(f.Type)
+		if separatedBlob(f) {
+			tw.blobCols[i] = &blobColAccum{}
+		}
 	}
 	// Reserve the header region so the body starts at a fixed offset.
 	if _, err := w.WriteAt(make([]byte, HeaderSize), 0); err != nil {
@@ -164,7 +176,13 @@ func (w *Writer) flushGroup() error {
 	g := rowGroupMeta{firstRow: w.rowCount, numRows: w.bufRows}
 	groupStart := w.pos
 	for i := range w.builders {
-		cm, err := w.writeChunk(i, w.builders[i].column())
+		var cm chunkMeta
+		var err error
+		if w.blobCols[i] != nil {
+			cm, err = w.writeBlobRefChunk(i, w.builders[i].column())
+		} else {
+			cm, err = w.writeChunk(i, w.builders[i].column())
+		}
 		if err != nil {
 			return err
 		}
@@ -252,6 +270,12 @@ func (w *Writer) flags() uint16 {
 	if _, ok := w.schema.sortKeyIndex(); ok {
 		fl |= FlagSorted
 	}
+	if len(w.meta.blobCols) > 0 {
+		fl |= FlagHasBlobRegion
+	}
+	if len(w.meta.dicts) > 0 {
+		fl |= FlagHasDictRegion
+	}
 	return fl
 }
 
@@ -266,6 +290,9 @@ func (w *Writer) Close() error {
 		return w.err
 	}
 	if err := w.flushGroup(); err != nil {
+		return err
+	}
+	if err := w.writeBlobRegions(); err != nil {
 		return err
 	}
 

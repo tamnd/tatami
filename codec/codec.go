@@ -85,7 +85,7 @@ var (
 // level that balances ratio against write CPU. Later milestones tune the level
 // per region; for now one level serves every page.
 func Default() (Codec, error) {
-	return Zstandard(zstd.SpeedBetterCompression)
+	return Zstandard(DefaultLevel)
 }
 
 // Zstandard returns a shared deterministic zstd codec at the given level. The
@@ -117,7 +117,11 @@ func Zstandard(level zstd.EncoderLevel) (Codec, error) {
 // Identity returns the no-op codec that stores payloads verbatim.
 func Identity() Codec { return none{} }
 
-// ByID returns the codec for an on-disk identifier.
+// ByID returns the codec for an on-disk identifier. ZstdDict is intentionally
+// absent: a dictionary codec needs its dictionary bytes, which the generic page
+// path never has. Blob-region records carry the ZstdDict id but are always read
+// through a Dict codec the reader builds from the loaded dictionary, never
+// through ByID.
 func ByID(id ID) (Codec, error) {
 	switch id {
 	case None:
@@ -128,3 +132,65 @@ func ByID(id ID) (Codec, error) {
 		return nil, fmt.Errorf("codec: unsupported codec id %d", id)
 	}
 }
+
+// rawDictID is the dictionary identifier embedded in a raw-dictionary zstd
+// frame. Each Dict codec is bound to one dictionary, so a single fixed id serves
+// every column; the encoder and decoder of one codec always agree on it.
+const rawDictID = 1
+
+// dictCodec is deterministic single-threaded zstd bound to a raw content
+// dictionary. The dictionary is shared match history across every record the
+// codec compresses, so the repeated boilerplate in separated blob payloads
+// (cookie banners, nav chrome, license headers) collapses against it. Unlike a
+// trained zstd dictionary it carries no entropy tables, which keeps it robust
+// and byte-stable.
+type dictCodec struct {
+	enc *zstd.Encoder
+	dec *zstd.Decoder
+}
+
+func (d *dictCodec) ID() ID { return ZstdDict }
+
+func (d *dictCodec) Compress(dst, src []byte) []byte {
+	return d.enc.EncodeAll(src, dst)
+}
+
+func (d *dictCodec) Decompress(dst, src []byte, uncompressedSize int) ([]byte, error) {
+	if cap(dst) < uncompressedSize {
+		grown := make([]byte, len(dst), len(dst)+uncompressedSize)
+		copy(grown, dst)
+		dst = grown
+	}
+	return d.dec.DecodeAll(src, dst)
+}
+
+// NewZstdDict returns a deterministic zstd codec that compresses and
+// decompresses against the raw content dictionary dict at the given level. An
+// empty dictionary is rejected; the caller should fall back to a plain zstd
+// codec when it has no dictionary to train. The returned codec's ID is ZstdDict.
+func NewZstdDict(dict []byte, level zstd.EncoderLevel) (Codec, error) {
+	if len(dict) == 0 {
+		return nil, fmt.Errorf("codec: empty dictionary")
+	}
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(level),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithEncoderDictRaw(rawDictID, dict),
+	)
+	if err != nil {
+		return nil, err
+	}
+	dec, err := zstd.NewReader(nil,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderDictRaw(rawDictID, dict),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &dictCodec{enc: enc, dec: dec}, nil
+}
+
+// DefaultLevel is the zstd level the writer pins for both page and blob-record
+// compression, kept in one place so the block codec and the dictionary codec
+// agree.
+const DefaultLevel = zstd.SpeedBetterCompression
