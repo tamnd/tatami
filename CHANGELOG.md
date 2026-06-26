@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M1 encoding cascade. A new `encoding/` subpackage holds the physical per-page
+  encoders: BITPACK_FOR, DELTA, RLE, GROUPVARINT, and PFORDELTA for the integer
+  family, and BITMAP for bool. A greedy per-page sampler takes PLAIN as the floor
+  and trades up to the smallest applicable encoding, recording the choice in the
+  page header. Floats, strings, and bytes stay on PLAIN until the dictionary
+  region lands in M2. On a crawl-metadata sample the integer and bool columns
+  drop to roughly two bytes per row before the block codec runs.
 - M0 container. The on-disk format: fixed 64-byte header, row groups of column
   chunks, page framing with uncompressed page headers, a self-describing footer
   written last, and a short trailer carrying the footer length, footer CRC32C,
