@@ -207,16 +207,49 @@ func (inv *Inverted) MaxFreq(term string) uint32 {
 	return inv.lists[e.PostingOffset].MaxFreq()
 }
 
+// GlobalStats supplies the corpus-wide statistics that make a shard's scores
+// comparable across shards: the total live document count N over every shard and
+// the global document frequency of a term, summed over every shard. A shard
+// scored with global stats produces scores a broker can rank directly against
+// other shards' scores, which is what makes a pruned, early-terminating
+// cross-shard top-k exact rather than best-effort (12-distributed-serving.md).
+// A RoutingIndex satisfies this interface.
+type GlobalStats interface {
+	// NumDocs is N, the live document count across the whole collection.
+	NumDocs() int
+	// DocFreq is the term's document frequency summed across every shard.
+	DocFreq(term string) int
+}
+
 // Search runs the block-max WAND top-k over the disjunction of the query terms,
-// scored by single-field BM25 with the shared k1 saturation. It returns the hits
-// highest score first. Terms absent from the segment are skipped.
+// scored by single-field BM25 with the shared k1 saturation, using this shard's
+// own document count for IDF. It returns the hits highest score first. Terms
+// absent from the segment are skipped.
 func (inv *Inverted) Search(terms []string, k int) []Hit {
+	return inv.SearchWith(terms, k, nil)
+}
+
+// SearchWith is Search with the IDF of every term computed from the supplied
+// global stats rather than this shard's local document count. A nil stats falls
+// back to per-shard IDF, which is what a single-segment query wants. A broker
+// serving many shards passes the same global stats to every shard so the scores
+// it merges are on one scale, the precondition the cross-shard top-k merge and
+// its early termination rely on (12-distributed-serving.md). The MaxFreq each
+// term contributes to its WAND upper bound stays shard-local, because it bounds
+// the frequencies in this shard's own postings; only the IDF goes global.
+func (inv *Inverted) SearchWith(terms []string, k int, stats GlobalStats) []Hit {
 	col := Collection{N: inv.numDocs}
+	if stats != nil {
+		col = Collection{N: stats.NumDocs()}
+	}
 	var inputs []TermInput
 	for _, t := range terms {
 		cur, df, ok := inv.Postings(t)
 		if !ok {
 			continue
+		}
+		if stats != nil {
+			df = stats.DocFreq(t)
 		}
 		idf := col.IDF(df)
 		inputs = append(inputs, TermInput{
@@ -231,6 +264,24 @@ func (inv *Inverted) Search(terms []string, k int) []Hit {
 		return WAND(inputs, k)
 	}
 	return WANDFilter(inputs, k, func(d DocID) bool { return inv.live.Get(int(d)) })
+}
+
+// EachTerm calls fn for every term in the dictionary with its document frequency
+// and its maximum in-document frequency, in ascending term order. It is the input
+// to the routing builder, which folds each shard's terms into the broker's
+// term-to-shards map (12-distributed-serving.md). It reads only the dictionary
+// and skip tables, never a posting payload, so building a routing index over many
+// shards stays cheap.
+func (inv *Inverted) EachTerm(fn func(term string, df int, maxFreq uint32)) {
+	for _, t := range inv.dict.Terms() {
+		var mf uint32
+		if t.Entry.Singleton {
+			mf = t.Entry.SingletonFreq
+		} else if int(t.Entry.PostingOffset) < len(inv.lists) {
+			mf = inv.lists[t.Entry.PostingOffset].MaxFreq()
+		}
+		fn(t.Term, t.Entry.DocFreq, mf)
+	}
 }
 
 // EncodeInverted serializes an inverted index into the three byte runs of the

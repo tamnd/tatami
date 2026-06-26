@@ -325,6 +325,16 @@ func (s *SearchSegment) Query(query string, k int) []search.Hit {
 	return s.inv.Search(tokenize(query), k)
 }
 
+// SearchTermsWith runs the block-max WAND loop over already-tokenized query terms
+// with corpus-wide statistics, so a broker serving many shards scores every shard
+// against the same global IDF and the partial top-k lists it merges are on one
+// scale. Passing nil stats falls back to this shard's local IDF, which is the
+// single-segment path. This is the entry the Cluster broker drives
+// (12-distributed-serving.md).
+func (s *SearchSegment) SearchTermsWith(terms []string, k int, stats search.GlobalStats) []search.Hit {
+	return s.inv.SearchWith(terms, k, stats)
+}
+
 // Search runs the top-k retrieval and then fetches the url and title of each
 // surviving document from the forward columns, the full query-to-results path.
 func (s *SearchSegment) Search(query string, k int) ([]SearchResult, error) {

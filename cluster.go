@@ -1,0 +1,392 @@
+package tatami
+
+// A leaf node serves a handful of segments by opening all of them, and an Index
+// does exactly that. A broker over a hundred thousand shards cannot: it cannot
+// hold that many files open, and it cannot afford to run the WAND loop on every
+// shard for every query. A Cluster is the broker that makes both costs scale with
+// the shards that can actually contribute to the answer rather than the shards
+// that exist (12-distributed-serving.md).
+//
+// It rests on three things built elsewhere in this milestone. A routing index
+// (search.RoutingIndex) maps each term to the shards that hold it with a per-shard
+// impact bound, so a query visits shards in descending bound order and stops the
+// moment the next shard's bound cannot beat the current k-th best score. The same
+// routing index is the global-statistics source every shard is scored with, so
+// the partial top-k lists the broker merges are on one scale and the merged top-k
+// is exact. A lazy LRU cache keeps only the working set of shards open, so the
+// open-file cost is the cache capacity, not the shard count.
+//
+// The early stop is safe because a shard's bound is a true upper bound on any
+// score it can produce: BM25 here disables length normalization, so a term's
+// contribution is monotonic in frequency and the shard maximum frequency gives a
+// real ceiling. A shard is skipped only when that ceiling is strictly below the
+// current k-th best score, so no document it holds could have entered the top-k
+// under any tie-break. The pruned result is therefore byte-identical to visiting
+// every shard.
+
+import (
+	"container/list"
+	"sort"
+	"sync"
+
+	"github.com/tamnd/tatami/search"
+)
+
+// Cluster serves many search-segment files as one logical index, routing each
+// query to the shards that can contribute and keeping only a bounded working set
+// of segments open. It is not safe for concurrent queries: a segment's lazy
+// column caches and the open-segment LRU are mutated on the query path and are
+// guarded by one mutex, so queries serialize. Fleet-level concurrency is a
+// front-end concern that runs one Cluster per worker (12-distributed-serving.md).
+type Cluster struct {
+	paths   []string
+	routing *search.RoutingIndex
+
+	mu    sync.Mutex
+	open  map[int]*list.Element // shard id -> element in lru
+	lru   *list.List            // front = most recently used; value is *openShard
+	limit int
+}
+
+// openShard is one resident segment in the LRU.
+type openShard struct {
+	shard int
+	seg   *SearchSegment
+}
+
+// ClusterOptions tunes a Cluster. CacheSize caps how many segments stay open at
+// once; a query that routes to more shards than this still answers correctly,
+// evicting the least recently used segment to stay within the cap.
+type ClusterOptions struct {
+	CacheSize int
+}
+
+// DefaultCacheSize is the open-segment cap when ClusterOptions leaves it zero. It
+// is the working-set size a broker keeps resident, deliberately tiny next to the
+// shard count.
+const DefaultCacheSize = 64
+
+// OpenCluster builds a routing index over every shard in paths and returns a
+// broker that serves them. Building the routing index opens each file once to read
+// its dictionary, then closes it, so the steady-state open-file count is the cache
+// cap rather than the shard count. The shard ids the routing index assigns are the
+// indices into paths, so a routed shard maps straight back to its file.
+func OpenCluster(paths []string, opts ClusterOptions) (*Cluster, error) {
+	b := search.NewRoutingBuilder()
+	for _, p := range paths {
+		seg, err := OpenSearch(p)
+		if err != nil {
+			return nil, err
+		}
+		b.AddShard(seg.Inverted())
+		if err := seg.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return OpenClusterWithRouting(paths, b.Build(), opts), nil
+}
+
+// OpenClusterWithRouting returns a broker over paths using an already-built
+// routing index, for callers that loaded the routing sidecar instead of
+// re-scanning every shard. The routing index must have been built over the same
+// paths in the same order, since shard ids are path indices.
+func OpenClusterWithRouting(paths []string, routing *search.RoutingIndex, opts ClusterOptions) *Cluster {
+	limit := opts.CacheSize
+	if limit <= 0 {
+		limit = DefaultCacheSize
+	}
+	return &Cluster{
+		paths:   paths,
+		routing: routing,
+		open:    make(map[int]*list.Element),
+		lru:     list.New(),
+		limit:   limit,
+	}
+}
+
+// Routing exposes the routing index, for stats and for persisting the sidecar.
+func (c *Cluster) Routing() *search.RoutingIndex { return c.routing }
+
+// NumShards is how many shards the cluster serves.
+func (c *Cluster) NumShards() int { return len(c.paths) }
+
+// NumDocs is the live document count across every shard, from the routing index,
+// without opening a segment.
+func (c *Cluster) NumDocs() int { return c.routing.NumDocs() }
+
+// Close closes every segment still open in the cache.
+func (c *Cluster) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var first error
+	for e := c.lru.Front(); e != nil; e = e.Next() {
+		if err := e.Value.(*openShard).seg.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	c.open = make(map[int]*list.Element)
+	c.lru.Init()
+	return first
+}
+
+// getSegment returns the open segment for a shard, opening it and evicting the
+// least recently used segment if the cache is full. The caller holds c.mu.
+func (c *Cluster) getSegment(shard int) (*SearchSegment, error) {
+	if e, ok := c.open[shard]; ok {
+		c.lru.MoveToFront(e)
+		return e.Value.(*openShard).seg, nil
+	}
+	seg, err := OpenSearch(c.paths[shard])
+	if err != nil {
+		return nil, err
+	}
+	for c.lru.Len() >= c.limit {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		os := back.Value.(*openShard)
+		c.lru.Remove(back)
+		delete(c.open, os.shard)
+		if err := os.seg.Close(); err != nil {
+			_ = seg.Close()
+			return nil, err
+		}
+	}
+	c.open[shard] = c.lru.PushFront(&openShard{shard: shard, seg: seg})
+	return seg, nil
+}
+
+// CacheLen reports how many segments are currently open, for tests and metrics.
+func (c *Cluster) CacheLen() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lru.Len()
+}
+
+// QueryStats reports how a routed query was answered: how many shards held a query
+// term, how many the broker actually visited before the bound pruned the rest, and
+// the score threshold the prune fired against. A test asserts Visited is far below
+// Candidates while the results stay exact.
+type QueryStats struct {
+	Candidates int     // shards holding at least one query term
+	Visited    int     // shards actually opened and scored
+	Threshold  float32 // k-th best score when the walk stopped, zero if fewer than k hits
+}
+
+// Query is the retrieval-only path: the global top-k of (shard, dense id, score)
+// across the routed shards, scored with global statistics and pruned by the bound
+// walk, without fetching stored fields. It is what the scale latency benchmark
+// times. The second return value reports the routing and pruning that produced it.
+func (c *Cluster) Query(query string, k int) ([]ClusterHit, QueryStats, error) {
+	if k <= 0 {
+		return nil, QueryStats{}, nil
+	}
+	terms := tokenize(query)
+	bounds := c.routing.Route(terms)
+	stats := QueryStats{Candidates: len(bounds)}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var cands []ClusterHit
+	th := newMinHeap(k)
+	for _, sb := range bounds {
+		if th.full() && sb.Bound < th.min() {
+			break
+		}
+		seg, err := c.getSegment(int(sb.Shard))
+		if err != nil {
+			return nil, stats, err
+		}
+		stats.Visited++
+		for _, h := range seg.SearchTermsWith(terms, k, c.routing) {
+			cands = append(cands, ClusterHit{Shard: int(sb.Shard), Doc: uint32(h.Doc), Score: float32(h.Score)})
+			th.push(h.Score)
+		}
+	}
+	if th.full() {
+		stats.Threshold = float32(th.min())
+	}
+
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].Score != cands[j].Score {
+			return cands[i].Score > cands[j].Score
+		}
+		if cands[i].Shard != cands[j].Shard {
+			return cands[i].Shard < cands[j].Shard
+		}
+		return cands[i].Doc < cands[j].Doc
+	})
+	if len(cands) > k {
+		cands = cands[:k]
+	}
+	return cands, stats, nil
+}
+
+// Search runs the routed, pruned retrieval and then fetches the url and title of
+// each surviving hit, deduplicating a page that more than one shard carries after
+// a recrawl by its stable doc_id and keeping the highest-scoring copy. Like the
+// leaf Index it over-fetches per shard so duplicates collapsing cannot leave fewer
+// than k distinct results, and it prunes against the k-th best distinct score.
+func (c *Cluster) Search(query string, k int) ([]SearchResult, QueryStats, error) {
+	if k <= 0 {
+		return nil, QueryStats{}, nil
+	}
+	terms := tokenize(query)
+	bounds := c.routing.Route(terms)
+	stats := QueryStats{Candidates: len(bounds)}
+	perShard := k
+	if len(bounds) > 1 {
+		perShard = k * 2
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	best := make(map[string]clusterCand)
+	for _, sb := range bounds {
+		if th, ok := kthDistinct(best, k); ok && sb.Bound < th {
+			break
+		}
+		seg, err := c.getSegment(int(sb.Shard))
+		if err != nil {
+			return nil, stats, err
+		}
+		stats.Visited++
+		for _, h := range seg.SearchTermsWith(terms, perShard, c.routing) {
+			id, err := seg.globalDocID(uint32(h.Doc))
+			if err != nil {
+				return nil, stats, err
+			}
+			cand := clusterCand{score: float32(h.Score), shard: int(sb.Shard), dense: uint32(h.Doc), id: id}
+			if cur, ok := best[id]; !ok || cand.better(cur) {
+				best[id] = cand
+			}
+		}
+	}
+	if th, ok := kthDistinct(best, k); ok {
+		stats.Threshold = float32(th)
+	}
+
+	ranked := make([]clusterCand, 0, len(best))
+	for _, c := range best {
+		ranked = append(ranked, c)
+	}
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].better(ranked[j]) })
+	if len(ranked) > k {
+		ranked = ranked[:k]
+	}
+
+	out := make([]SearchResult, 0, len(ranked))
+	for _, rc := range ranked {
+		seg, err := c.getSegment(rc.shard)
+		if err != nil {
+			return nil, stats, err
+		}
+		url, title, err := seg.storedFields(rc.dense)
+		if err != nil {
+			return nil, stats, err
+		}
+		out = append(out, SearchResult{Doc: rc.dense, URL: url, Title: title, Score: rc.score})
+	}
+	return out, stats, nil
+}
+
+// ClusterHit is a scored hit tagged with the shard that produced it.
+type ClusterHit struct {
+	Shard int
+	Doc   uint32
+	Score float32
+}
+
+// clusterCand is one candidate on its way through the dedup merge.
+type clusterCand struct {
+	score float32
+	shard int
+	dense uint32
+	id    string
+}
+
+// better orders candidates by score descending, then by stable doc_id ascending,
+// the same total order the leaf Index merge uses so the two agree exactly.
+func (a clusterCand) better(b clusterCand) bool {
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	return a.id < b.id
+}
+
+// kthDistinct returns the k-th best distinct score among the deduped candidates so
+// far, the threshold the bound walk prunes against, and whether at least k distinct
+// candidates exist yet.
+func kthDistinct(best map[string]clusterCand, k int) (search.Score, bool) {
+	if len(best) < k {
+		return 0, false
+	}
+	scores := make([]float32, 0, len(best))
+	for _, c := range best {
+		scores = append(scores, c.score)
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i] > scores[j] })
+	return search.Score(scores[k-1]), true
+}
+
+// minHeap is a bounded min-heap of scores that tracks the k-th best score seen, so
+// the retrieval path knows its pruning threshold without re-sorting all candidates.
+// It keeps the k largest scores; once full, its minimum is the k-th best.
+type minHeap struct {
+	data []search.Score
+	cap  int
+}
+
+func newMinHeap(k int) *minHeap { return &minHeap{cap: k} }
+
+func (h *minHeap) full() bool { return len(h.data) >= h.cap }
+
+func (h *minHeap) min() search.Score { return h.data[0] }
+
+func (h *minHeap) push(v search.Score) {
+	if h.cap <= 0 {
+		return
+	}
+	if len(h.data) < h.cap {
+		h.data = append(h.data, v)
+		h.up(len(h.data) - 1)
+		return
+	}
+	if v <= h.data[0] {
+		return
+	}
+	h.data[0] = v
+	h.down(0)
+}
+
+func (h *minHeap) up(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if h.data[p] <= h.data[i] {
+			break
+		}
+		h.data[p], h.data[i] = h.data[i], h.data[p]
+		i = p
+	}
+}
+
+func (h *minHeap) down(i int) {
+	n := len(h.data)
+	for {
+		l, r, small := 2*i+1, 2*i+2, i
+		if l < n && h.data[l] < h.data[small] {
+			small = l
+		}
+		if r < n && h.data[r] < h.data[small] {
+			small = r
+		}
+		if small == i {
+			break
+		}
+		h.data[small], h.data[i] = h.data[i], h.data[small]
+		i = small
+	}
+}
