@@ -8,7 +8,7 @@ weight: 10
 tatami [command] [flags]
 ```
 
-The CLI inspects, reads, converts, and catalogs `.tatami` files. Run `tatami <command> --help` for the canonical, up-to-date list.
+The CLI inspects, reads, converts, catalogs, and serves `.tatami` files. Run `tatami <command> --help` for the canonical, up-to-date list.
 
 ## tatami inspect
 
@@ -81,6 +81,33 @@ tatami collection compact <dir>
 ```
 
 Rolls the append-only manifest log into a fresh one containing only the live set, dropping accumulated add-and-remove churn. The swap is atomic (write a temp file, rename it into place).
+
+## tatami serve
+
+```
+tatami serve <dir> [flags]
+```
+
+Serves the `.tatami` search segments under a directory over HTTP. It globs the top-level `*.tatami` files in sorted order so the shard ids stay stable across restarts, builds a routing index across them, opens a broker that keeps only a bounded working set of segments resident, and answers queries without a shared lock so one process handles many concurrent requests.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--addr` | `:8080` | Address to listen on |
+| `--cache` | `64` | Max segments kept open at once |
+| `--max-in-flight` | `256` | Max concurrent queries before shedding with 503 |
+| `--timeout` | `2s` | Per-query deadline before 504 |
+| `--max-k` | `100` | Largest result count a request may ask for |
+| `--default-k` | `10` | Result count when a request omits k |
+
+The server exposes three endpoints:
+
+| Endpoint | Meaning |
+|----------|---------|
+| `GET /search?q=<query>&k=<n>` | Ranked JSON results; `k` is optional and capped at `--max-k` |
+| `GET /healthz` | Plain `200` liveness probe |
+| `GET /stats` | Broker shape (shards, docs, resident segments) and serving counters (total, rejected, timed out, canceled, failed) |
+
+Size `--cache` to hold the working set the queries actually touch, not just the shards that reach a top result, or a broad query thrashes on cold segment decodes. An interrupt (`SIGINT` or `SIGTERM`) drains the in-flight queries before the process exits. See [serving search over HTTP](/guides/serving-over-http/) for the full workflow.
 
 ## tatami version
 

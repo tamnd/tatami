@@ -92,7 +92,10 @@ Splitting the same Common Crawl shard, 20246 documents, into twenty segments and
 
 The overall p99 of 465 microseconds is more than twenty times under the ten-millisecond goal, fanning out to twenty segments and merging a global top-k on every query. The single-segment path on the same data is a 237 microsecond p99; the difference is the price of the fan-out and the per-query merge, and it leaves enough headroom that a leaf could hold an order of magnitude more segments and still answer inside the budget.
 
+An `Index` reaches the segments one machine can hold and merges per-segment top-k lists best-effort. To serve a fleet of shards with exact cross-shard ranking, a routed broker that visits only the shards a query needs, and an aggregator over many brokers, see [distributed serving at scale](/guides/distributed-serving/). To run that broker over HTTP, see [serving search over HTTP](/guides/serving-over-http/).
+
 ## Where to go next
 
+- For the routed broker, exact cross-shard ranking, search-only segments, and the aggregator tier, see [distributed serving at scale](/guides/distributed-serving/).
 - For the inverted region and the live-docs record on disk, see the [file-format reference](/reference/file-format/).
 - For the full type list, see the [Go API reference](/reference/go-api/).

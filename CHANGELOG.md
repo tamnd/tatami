@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions track
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-06-27
 
 ### Added
 
@@ -31,8 +31,8 @@ All notable changes to this project are documented here. The format follows
   The smart-cache finding is that sub-10ms needs the working set resident: a cache
   below the visited working set thrashes on cold inverted-index decodes, so the
   server sizes the cache to hold it. On the real shard split into 254 shards, with
-  the working set warm, single-keyword serving runs a p99 of 1.2 ms at 32,555
-  queries per second under one in-flight query per core, comfortably inside the
+  the working set warm, single-keyword serving runs a p99 of about 1.4 ms at over
+  31,000 queries per second under one in-flight query per core, comfortably inside the
   ten millisecond goal; multi-term phrases stay well under the budget at the
   median and are bounded at the tail by admission and the deadline rather than
   gated. Resident segments hold at the cache cap of 128 through five thousand

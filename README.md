@@ -14,7 +14,7 @@ Full documentation, with guides and the complete reference, is at [tatami.tamnd.
 
 ## Status
 
-Complete. The format and the search engine are both implemented and proven on real Common Crawl data. A `.tatami` file is a stable, self-describing container with an encoding cascade, blob separation, shared trained dictionaries, zone maps, bloom filters, and a sparse key index. A manifest stitches many files into one collection, the `convert` command brings existing Parquet shards in, and the search-segment role adds an inverted index with BM25 ranking and block-max WAND retrieval. On a real shard, 20246 documents and 1.4 million terms, keyword queries return with a p99 of 237 microseconds; served across twenty segments at once, fan-out retrieval stays at a p99 of 465 microseconds, more than twenty times under the ten-millisecond goal the format was built to hit. A search-only segment drops the document body it never serves and keeps a short snippet, 42.8 percent smaller on a real shard with byte-identical retrieval, and an aggregator tier fans a query out to many leaf brokers and merges an exact fleet-wide top-k, projecting a p99 of 1.29 milliseconds at a hundred thousand shards. The `tatami serve` command puts an HTTP server over a lock-free broker with admission control, a per-request deadline, and a smart segment cache sized to hold the working set: single-keyword serving holds a p99 of 1.2 milliseconds at 32,555 queries per second on real data, the resident memory stays bounded by the cache cap under thousands of concurrent queries, and a concurrent answer is exact, identical to the single-threaded one.
+Complete. The format and the search engine are both implemented and proven on real Common Crawl data. A `.tatami` file is a stable, self-describing container with an encoding cascade, blob separation, shared trained dictionaries, zone maps, bloom filters, and a sparse key index. A manifest stitches many files into one collection, the `convert` command brings existing Parquet shards in, and the search-segment role adds an inverted index with BM25 ranking and block-max WAND retrieval. On a real shard, 20246 documents and 1.4 million terms, keyword queries return with a p99 of 237 microseconds; served across twenty segments at once, fan-out retrieval stays at a p99 of 465 microseconds, more than twenty times under the ten-millisecond goal the format was built to hit. A search-only segment drops the document body it never serves and keeps a short snippet, 42.8 percent smaller on a real shard with byte-identical retrieval, and an aggregator tier fans a query out to many leaf brokers and merges an exact fleet-wide top-k, projecting a p99 of 1.29 milliseconds at a hundred thousand shards. The `tatami serve` command puts an HTTP server over a lock-free broker with admission control, a per-request deadline, and a smart segment cache sized to hold the working set: single-keyword serving holds a p99 of about 1.4 milliseconds at over 31,000 queries per second on real data, the resident memory stays bounded by the cache cap under thousands of concurrent queries, and a concurrent answer is exact, identical to the single-threaded one.
 
 ## Install
 
@@ -51,6 +51,15 @@ Dump rows to JSONL, with optional column projection and a row limit:
 ```bash
 tatami cat data.tatami --columns url,status --limit 10
 ```
+
+Serve a directory of search segments over HTTP, then query it:
+
+```bash
+tatami serve ./segments --addr :8080
+curl 'localhost:8080/search?q=open+source+software&k=10'
+```
+
+The command set is `inspect`, `cat`, `convert`, `collection` (alias `col`, with `add`/`list`/`compact`), and `serve`. Run `tatami <command> --help` for flags, or see the [CLI reference](https://tatami.tamnd.com/reference/cli/).
 
 ## Writing a file
 
@@ -91,7 +100,9 @@ for g := 0; g < r.NumRowGroups(); g++ {
 
 A `.tatami` file is laid out as a fixed 64-byte header, a run of row groups, an optional blob region for separated large payloads, optional dictionary and index regions, then a footer directory and a short trailer. The footer is written last and carries the full schema and the byte offsets of every column chunk, so opening a file is one read of the tail followed by seeks straight to the columns a query needs. The magic `TAT1` sits at both ends, every page header is uncompressed so a reader can stride over pages without decoding them, and a CRC32C guards each page payload and the footer.
 
-Two roles share the layout. A document-store file holds the crawled columns as written. A search-segment file (a header flag bit) adds an inverted region so the same reader can answer keyword queries. The design notes live in the spec; the implementation notes track each milestone as it lands.
+Two roles share the layout. A document-store file holds the crawled columns as written. A search-segment file (a header flag bit) adds an inverted region so the same reader can answer keyword queries. A search-only segment drops the body once the postings are built and keeps a snippet, a fraction of the size with identical retrieval.
+
+Past one file, a `Cluster` broker serves a fan of cold shards behind one query: a routing index keeps it to the shards that can contribute, and global statistics make the merged top-k exact rather than approximate. An `Aggregator` fans a query across many brokers and merges one fleet-wide top-k, and `tatami serve` runs a broker over HTTP, answering thousands of concurrent queries without a shared lock behind a smart segment cache, admission control, and a per-request deadline. The design notes live in the spec; the implementation notes track each milestone as it lands.
 
 ## License
 

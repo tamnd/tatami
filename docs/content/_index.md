@@ -24,6 +24,7 @@ tatami inspect shard.tatami
 - **Reads only what you touch.** The footer is written last and carries the full schema and every column offset, so opening a file is one tail read and then seeks straight to the columns a query asks for. Zone maps, bloom filters, and a sparse primary-key index prune row groups and pages before any decode.
 - **Doubles as a search index.** Flip a header bit and the same file gains an inverted region with a posting codec, BM25F scoring, and block-max WAND retrieval. On a real Common Crawl shard, keyword queries return with a p99 of 237 microseconds.
 - **Scales to many files.** A manifest stitches thousands of files into one logical collection for cross-file pruning, and a tiered merge folds small search segments into large ones. Served across twenty segments, fan-out keyword retrieval stays at a p99 of 465 microseconds.
+- **Serves a fleet behind one query.** A routed broker visits only the shards a query needs and ranks them exactly against global statistics, an aggregator merges many brokers into one fleet-wide top-k, and `tatami serve` answers thousands of concurrent queries over HTTP without a shared lock. Single-keyword serving holds a p99 of about 1.5 milliseconds at over 31,000 queries per second on a real shard, with the memory bounded by a smart cache.
 
 ## Built for the fleet
 
@@ -33,5 +34,5 @@ tatami is the storage layer for a crawl-to-search pipeline, not a standalone pro
 
 - New here? Start with the [introduction](/getting-started/introduction/), then the [quick start](/getting-started/quick-start/).
 - Want to install it? See [installation](/getting-started/installation/).
-- Looking for a specific job? The [guides](/guides/) cover writing and reading files from Go, converting crawl shards, managing a collection, and building and serving a search index.
+- Looking for a specific job? The [guides](/guides/) cover writing and reading files from Go, converting crawl shards, managing a collection, building and serving a search index, serving a fleet of shards behind one query, and running the broker over HTTP.
 - Need the full surface? The [CLI reference](/reference/cli/), the [file-format reference](/reference/file-format/), and the [Go API reference](/reference/go-api/) are exhaustive.
