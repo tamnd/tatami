@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- M7 tiered merge and serving at scale. A search index now scales from one file
+  to many. Deletions clear a bit in a live-docs bitset, one bit per dense
+  document id, so a delete is O(1) and never rewrites a sealed file; the
+  retrieval loop honors the bitset through a `keep` predicate (`WANDFilter`) that
+  stays exact because a delete never raises a score, so the block-max skip stays
+  valid (verified against an exhaustive scan over the live set). A tiered merge
+  policy (ten per tier, ten merged at once, two-thousand doc floor,
+  thirty-three percent delete threshold) folds small segments into large ones;
+  `MergeSegments` reads N segments and writes one, re-deriving dense ids in one
+  ascending pass, dropping deleted documents, and rebuilding the postings, skip
+  tables, and term dictionary from scratch (a merge of split segments is
+  byte-identical in retrieval to a monolith over the same documents). An `Index`
+  serves many segments behind one query, fanning out, merging a global top-k, and
+  deduplicating a re-crawled page by its stable `doc_id`. The live-docs record is
+  an optional index record written only when something is deleted, and the footer
+  descriptor reads it only when present, so M6 files decode unchanged. Splitting
+  the production ccrawl-cli shard into twenty segments served as one Index, the
+  fan-out keyword query p99 is 465 microseconds, more than twenty times under the
+  ten millisecond goal.
 - M6 search-segment role. A tatami file can now be a search index, not only a
   cold document store. A header role bit turns the same container into a search
   segment: a forward store laid out as columns indexed by a dense document id

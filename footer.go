@@ -125,6 +125,11 @@ type invertDesc struct {
 	skipsLen    int64
 	numTerms    uint64
 	numDocs     uint64
+	// liveOff/liveLen locate the live-docs bitset run, a fourth index record that
+	// records which dense doc ids are not deleted. liveLen is zero on a segment
+	// built before the bitset was added, which a reader treats as all-live.
+	liveOff int64
+	liveLen int64
 }
 
 // fileMeta is everything the footer records about a file.
@@ -284,6 +289,8 @@ func (m *fileMeta) encodeInvert() []byte {
 	b = binary.AppendUvarint(b, uint64(m.invert.skipsLen))
 	b = binary.AppendUvarint(b, m.invert.numTerms)
 	b = binary.AppendUvarint(b, m.invert.numDocs)
+	b = binary.AppendUvarint(b, uint64(m.invert.liveOff))
+	b = binary.AppendUvarint(b, uint64(m.invert.liveLen))
 	return b
 }
 
@@ -298,6 +305,13 @@ func decodeInvert(body []byte, errp *error) invertDesc {
 	d.skipsLen = int64(c.uvarint())
 	d.numTerms = c.uvarint()
 	d.numDocs = c.uvarint()
+	// The live-docs run is appended by segments built after the bitset was added.
+	// A segment without it leaves bytes exhausted here, which is all-live, so only
+	// read the two fields when the section still has bytes.
+	if c.pos < len(c.b) {
+		d.liveOff = int64(c.uvarint())
+		d.liveLen = int64(c.uvarint())
+	}
 	if c.err != nil {
 		*errp = c.err
 		return invertDesc{}

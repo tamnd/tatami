@@ -61,6 +61,19 @@ func (t *termState) advance(target DocID) {
 // WAND returns the top-k documents of the disjunction of the given terms,
 // highest score first. With no terms or k <= 0 it returns nil.
 func WAND(terms []TermInput, k int) []Hit {
+	return WANDFilter(terms, k, nil)
+}
+
+// WANDFilter is WAND with a liveness predicate: a document for which keep returns
+// false is scored and skipped over but never enters the top-k, so its score never
+// raises the threshold. This is how a segment with deletions answers a query
+// without rewriting its posting lists - the deleted ids are filtered at scoring
+// time (09-search-scale.md, section 7). A nil keep keeps every document, which is
+// the plain WAND path. The result stays an exact top-k over the live documents:
+// the block-max bound is still a valid upper bound, so skipping is still safe; a
+// block holding only deleted documents simply is not skipped, a small cost paid
+// only when deletes are present.
+func WANDFilter(terms []TermInput, k int, keep func(DocID) bool) []Hit {
 	if k <= 0 || len(terms) == 0 {
 		return nil
 	}
@@ -100,8 +113,10 @@ func WAND(terms []TermInput, k int) []Hit {
 				skipBlock(live, pivotDoc)
 				continue
 			}
-			score := scoreDoc(live, pivotDoc)
-			threshold = pushTop(top, Hit{Doc: pivotDoc, Score: score}, k, threshold)
+			if keep == nil || keep(pivotDoc) {
+				score := scoreDoc(live, pivotDoc)
+				threshold = pushTop(top, Hit{Doc: pivotDoc, Score: score}, k, threshold)
+			}
 			// Advance every term that was sitting on pivotDoc.
 			for _, ts := range live {
 				if ts.doc == pivotDoc {
