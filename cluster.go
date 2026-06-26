@@ -179,12 +179,21 @@ type QueryStats struct {
 // walk, without fetching stored fields. It is what the scale latency benchmark
 // times. The second return value reports the routing and pruning that produced it.
 func (c *Cluster) Query(query string, k int) ([]ClusterHit, QueryStats, error) {
+	return c.QueryWith(query, k, c.routing)
+}
+
+// QueryWith is Query with the corpus statistics supplied from outside. An
+// aggregator passes fleet-wide stats so this leaf scores and prunes against the
+// same IDF every other leaf uses, which is what makes the merged cross-leaf top-k
+// exact (13-search-only-and-scale.md). The shard bounds are computed from the
+// same stats, so the early stop stays safe.
+func (c *Cluster) QueryWith(query string, k int, stats search.GlobalStats) ([]ClusterHit, QueryStats, error) {
 	if k <= 0 {
 		return nil, QueryStats{}, nil
 	}
 	terms := tokenize(query)
-	bounds := c.routing.Route(terms)
-	stats := QueryStats{Candidates: len(bounds)}
+	bounds := c.routing.RouteWith(terms, stats)
+	qstats := QueryStats{Candidates: len(bounds)}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -197,16 +206,16 @@ func (c *Cluster) Query(query string, k int) ([]ClusterHit, QueryStats, error) {
 		}
 		seg, err := c.getSegment(int(sb.Shard))
 		if err != nil {
-			return nil, stats, err
+			return nil, qstats, err
 		}
-		stats.Visited++
-		for _, h := range seg.SearchTermsWith(terms, k, c.routing) {
+		qstats.Visited++
+		for _, h := range seg.SearchTermsWith(terms, k, stats) {
 			cands = append(cands, ClusterHit{Shard: int(sb.Shard), Doc: uint32(h.Doc), Score: float32(h.Score)})
 			th.push(h.Score)
 		}
 	}
 	if th.full() {
-		stats.Threshold = float32(th.min())
+		qstats.Threshold = float32(th.min())
 	}
 
 	sort.Slice(cands, func(i, j int) bool {
@@ -221,7 +230,7 @@ func (c *Cluster) Query(query string, k int) ([]ClusterHit, QueryStats, error) {
 	if len(cands) > k {
 		cands = cands[:k]
 	}
-	return cands, stats, nil
+	return cands, qstats, nil
 }
 
 // Search runs the routed, pruned retrieval and then fetches the url and title of
@@ -230,16 +239,27 @@ func (c *Cluster) Query(query string, k int) ([]ClusterHit, QueryStats, error) {
 // leaf Index it over-fetches per shard so duplicates collapsing cannot leave fewer
 // than k distinct results, and it prunes against the k-th best distinct score.
 func (c *Cluster) Search(query string, k int) ([]SearchResult, QueryStats, error) {
+	return c.SearchWith(query, k, c.routing)
+}
+
+// SearchWith is Search with the corpus statistics supplied from outside, the path
+// an aggregator drives so every leaf scores against fleet-wide IDF and the merged
+// result is the exact fleet top-k. The dedup, over-fetch, and pruning are
+// identical to Search; only the statistics differ.
+func (c *Cluster) SearchWith(query string, k int, stats search.GlobalStats) ([]SearchResult, QueryStats, error) {
 	if k <= 0 {
 		return nil, QueryStats{}, nil
 	}
 	terms := tokenize(query)
-	bounds := c.routing.Route(terms)
-	stats := QueryStats{Candidates: len(bounds)}
-	perShard := k
-	if len(bounds) > 1 {
-		perShard = k * 2
-	}
+	bounds := c.routing.RouteWith(terms, stats)
+	qstats := QueryStats{Candidates: len(bounds)}
+	// Over-fetch per shard so duplicates collapsing cannot leave fewer than k
+	// distinct results, and so a tie at the k-th score keeps the doc_id-smaller
+	// copy. This is unconditional rather than gated on the shard count: when this
+	// cluster is a leaf under an aggregator, a leaf holding a single candidate
+	// shard must still surface the tie candidates the fleet merge ranks against,
+	// exactly as a single broker over every shard would (13-search-only-and-scale.md).
+	perShard := k * 2
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -251,13 +271,13 @@ func (c *Cluster) Search(query string, k int) ([]SearchResult, QueryStats, error
 		}
 		seg, err := c.getSegment(int(sb.Shard))
 		if err != nil {
-			return nil, stats, err
+			return nil, qstats, err
 		}
-		stats.Visited++
-		for _, h := range seg.SearchTermsWith(terms, perShard, c.routing) {
+		qstats.Visited++
+		for _, h := range seg.SearchTermsWith(terms, perShard, stats) {
 			id, err := seg.globalDocID(uint32(h.Doc))
 			if err != nil {
-				return nil, stats, err
+				return nil, qstats, err
 			}
 			cand := clusterCand{score: float32(h.Score), shard: int(sb.Shard), dense: uint32(h.Doc), id: id}
 			if cur, ok := best[id]; !ok || cand.better(cur) {
@@ -266,7 +286,7 @@ func (c *Cluster) Search(query string, k int) ([]SearchResult, QueryStats, error
 		}
 	}
 	if th, ok := kthDistinct(best, k); ok {
-		stats.Threshold = float32(th)
+		qstats.Threshold = float32(th)
 	}
 
 	ranked := make([]clusterCand, 0, len(best))
@@ -282,15 +302,15 @@ func (c *Cluster) Search(query string, k int) ([]SearchResult, QueryStats, error
 	for _, rc := range ranked {
 		seg, err := c.getSegment(rc.shard)
 		if err != nil {
-			return nil, stats, err
+			return nil, qstats, err
 		}
-		url, title, err := seg.storedFields(rc.dense)
+		f, err := seg.storedFields(rc.dense)
 		if err != nil {
-			return nil, stats, err
+			return nil, qstats, err
 		}
-		out = append(out, SearchResult{Doc: rc.dense, URL: url, Title: title, Score: rc.score})
+		out = append(out, SearchResult{Doc: rc.dense, DocID: rc.id, URL: f.url, Title: f.title, Snippet: f.snippet, Score: rc.score})
 	}
-	return out, stats, nil
+	return out, qstats, nil
 }
 
 // ClusterHit is a scored hit tagged with the shard that produced it.

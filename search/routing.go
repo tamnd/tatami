@@ -172,14 +172,25 @@ func (ri *RoutingIndex) EachPosting(fn func(term string, shard, df, maxFreq uint
 // twice in the query contributes its bound twice, exactly as the shard scores it
 // twice. That keeps the bound a true upper bound and the early stop exact.
 func (ri *RoutingIndex) Route(terms []string) []ShardBound {
-	col := Collection{N: ri.totalDocs}
+	return ri.RouteWith(terms, ri)
+}
+
+// RouteWith is Route with the corpus statistics supplied from outside rather than
+// taken from this index. An aggregator over many leaves passes fleet-wide N and
+// per-term document frequency here, so a leaf's shard bounds are computed against
+// the same IDF every other leaf scores with. That keeps the bound a true upper
+// bound on the fleet-scale score, so the cross-leaf top-k stays exact and the
+// per-leaf pruning stays safe (13-search-only-and-scale.md). Passing the index
+// itself reproduces Route, the single-broker path.
+func (ri *RoutingIndex) RouteWith(terms []string, stats GlobalStats) []ShardBound {
+	col := Collection{N: stats.NumDocs()}
 	bounds := make(map[uint32]Score)
 	for _, t := range terms {
 		tr := ri.terms[t]
 		if tr == nil {
 			continue
 		}
-		sc := bm25Scorer{idf: col.IDF(int(tr.globalDF)), k1: DefaultK1}
+		sc := bm25Scorer{idf: col.IDF(stats.DocFreq(t)), k1: DefaultK1}
 		for _, sp := range tr.shards {
 			bounds[sp.shard] += sc.MaxScore(sp.maxFreq)
 		}
