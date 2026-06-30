@@ -107,6 +107,19 @@ type SearchBuilder struct {
 	snippet      bool
 	snippetRunes int
 	snippets     []string
+	// bigrams, when non-nil, accumulates the shard's adjacent-pair statistics for
+	// the phrase routing sidecar: each ordered pair's document frequency and its
+	// maximum in-document adjacency count. It is built only when the caller asks for
+	// it, so a builder that never feeds a phrase router pays nothing (07-routing-latency.md,
+	// section 4.1).
+	bigrams map[search.BigramKey]*bigramStat
+}
+
+// bigramStat is one shard's running count for an adjacent pair: how many documents
+// hold the adjacency and the most times it occurs in any single one of them.
+type bigramStat struct {
+	df      uint32
+	maxFreq uint32
 }
 
 // SearchBuilderOptions selects the segment shape. Snippet turns on the
@@ -115,6 +128,11 @@ type SearchBuilder struct {
 type SearchBuilderOptions struct {
 	Snippet      bool
 	SnippetRunes int
+	// Bigrams turns on adjacent-pair capture for the phrase routing sidecar. It is
+	// off by default because only a corpus that will answer phrase queries needs it,
+	// and capturing it costs a per-document pass over adjacent tokens and a shard-wide
+	// pair dictionary (07-routing-latency.md, section 4.1).
+	Bigrams bool
 }
 
 // NewSearchBuilder returns an empty full-document builder, the shape that stores
@@ -135,6 +153,9 @@ func NewSearchBuilderWith(opts SearchBuilderOptions) *SearchBuilder {
 			b.snippetRunes = DefaultSnippetRunes
 		}
 	}
+	if opts.Bigrams {
+		b.bigrams = map[search.BigramKey]*bigramStat{}
+	}
 	return b
 }
 
@@ -145,11 +166,26 @@ func NewSearchBuilderWith(opts SearchBuilderOptions) *SearchBuilder {
 func (b *SearchBuilder) Add(doc SearchDoc) {
 	var norm [search.NumFields]uint16
 	freqs := map[string]uint32{}
+	// docBigrams counts this document's adjacent pairs, only when bigram capture is
+	// on. Adjacency is within a field: each index() call starts with no predecessor,
+	// so the last token of one field never pairs with the first token of the next.
+	var docBigrams map[search.BigramKey]uint32
+	if b.bigrams != nil {
+		docBigrams = map[search.BigramKey]uint32{}
+	}
 	index := func(text string, f search.Field) {
 		n := 0
+		var prev string
+		havePrev := false
 		for _, tok := range tokenize(text) {
 			freqs[tok]++
 			n++
+			if docBigrams != nil {
+				if havePrev {
+					docBigrams[search.BigramKey{A: prev, B: tok}]++
+				}
+				prev, havePrev = tok, true
+			}
 		}
 		norm[f] = capU16(n)
 	}
@@ -158,6 +194,21 @@ func (b *SearchBuilder) Add(doc SearchDoc) {
 	index(doc.Anchor, search.FieldAnchor)
 	index(doc.URL, search.FieldURL)
 
+	// Fold this document's pairs into the shard dictionary: each pair the document
+	// holds adds one to that pair's document frequency and lifts its shard maxFreq to
+	// the document's adjacency count if that count is a new high.
+	for key, cnt := range docBigrams {
+		bs := b.bigrams[key]
+		if bs == nil {
+			bs = &bigramStat{}
+			b.bigrams[key] = bs
+		}
+		bs.df++
+		if cnt > bs.maxFreq {
+			bs.maxFreq = cnt
+		}
+	}
+
 	b.inv.AddDocument(freqs)
 	b.norms = append(b.norms, norm)
 	if b.snippet {
@@ -165,6 +216,17 @@ func (b *SearchBuilder) Add(doc SearchDoc) {
 		doc.Body = "" // the body is indexed; do not carry it past this point
 	}
 	b.docs = append(b.docs, doc)
+}
+
+// EachBigram iterates the shard's adjacent pairs with each pair's document
+// frequency and maximum in-document adjacency count, so a BigramRoutingBuilder can
+// fold this shard into the phrase routing sidecar. It satisfies search.BigramSource.
+// A builder created without the Bigrams option captured nothing and iterates zero
+// pairs.
+func (b *SearchBuilder) EachBigram(fn func(a, bb string, df int, maxFreq uint32)) {
+	for key, bs := range b.bigrams {
+		fn(key.A, key.B, int(bs.df), bs.maxFreq)
+	}
 }
 
 // NumDocs reports how many documents have been added.

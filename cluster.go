@@ -41,6 +41,7 @@ import (
 type Cluster struct {
 	paths   []string
 	routing *search.RoutingIndex
+	bigram  *search.BigramRouting
 	cache   *segCache
 	// noSeed disables cross-shard threshold sharing (scale/07, M5). It exists only
 	// so a benchmark can measure the same routed query with and without the seed; in
@@ -96,6 +97,17 @@ func OpenClusterWithRouting(paths []string, routing *search.RoutingIndex, opts C
 // Routing exposes the routing index, for stats and for persisting the sidecar.
 func (c *Cluster) Routing() *search.RoutingIndex { return c.routing }
 
+// WithBigramRouting attaches a phrase routing sidecar and returns the cluster for
+// chaining. It is the only way to enable the phrase path: with it, QueryPhrase
+// narrows a phrase to the shards holding its adjacencies; without it, QueryPhrase
+// falls back to the bag route. The sidecar must have been built over the same
+// shards in the same order as the routing index, since both name shards by the
+// same ids (07-routing-latency.md, section 4.1).
+func (c *Cluster) WithBigramRouting(br *search.BigramRouting) *Cluster {
+	c.bigram = br
+	return c
+}
+
 // NumShards is how many shards the cluster serves.
 func (c *Cluster) NumShards() int { return len(c.paths) }
 
@@ -139,6 +151,64 @@ func (c *Cluster) QueryWith(query string, k int, stats search.GlobalStats) ([]Cl
 	}
 	terms := tokenize(query)
 	bounds := c.routing.RouteWith(terms, stats)
+	return c.runQuery(terms, k, stats, bounds)
+}
+
+// QueryPhrase is Query for a phrase: it narrows the candidate shards to those that
+// hold one of the phrase's adjacencies before scoring, instead of the union of the
+// shards holding any of its words. A common-word phrase unions into nearly every
+// shard as a bag of words, but its adjacencies are rare, so the phrase route is a
+// fraction of the bag route (07-routing-latency.md, section 4.1). The narrowing is
+// exact at the shard level: a shard absent from the phrase route provably holds no
+// document with the adjacency, so it could not hold a phrase match. When no bigram
+// sidecar is attached, or an adjacency is untracked, or the query is a single word,
+// it falls back to the exact bag route so the answer is never wrong, only wider.
+//
+// Scoring within a routed shard is still the bag-of-words WAND, because the
+// inverted index carries frequencies, not positions, so a routed shard's hits are
+// its best word-scored documents, biased to the shards where the phrase occurs.
+// Document-level phrase filtering waits on a positional index; this lever is the
+// routing half, which is where the fan-out cost lives.
+func (c *Cluster) QueryPhrase(query string, k int) ([]ClusterHit, QueryStats, error) {
+	return c.QueryPhraseWith(query, k, c.routing)
+}
+
+// QueryPhraseWith is QueryPhrase with corpus statistics supplied from outside, the
+// aggregator path, mirroring QueryWith.
+func (c *Cluster) QueryPhraseWith(query string, k int, stats search.GlobalStats) ([]ClusterHit, QueryStats, error) {
+	if k <= 0 {
+		return nil, QueryStats{}, nil
+	}
+	terms := tokenize(query)
+	if bounds, ok := c.phraseBounds(terms, stats); ok {
+		return c.runQuery(terms, k, stats, bounds)
+	}
+	return c.QueryWith(query, k, stats)
+}
+
+// phraseBounds returns the phrase route for terms and whether the phrase path
+// applies. It applies only when a bigram sidecar is attached and every adjacency in
+// the phrase is tracked, so the route is exact; otherwise the caller falls back to
+// the bag route. A tracked phrase that occurs in no shard returns an empty route
+// with ok true, which is the correct exact answer of no candidates, not a reason to
+// fall back.
+func (c *Cluster) phraseBounds(terms []string, stats search.GlobalStats) ([]search.ShardBound, bool) {
+	if c.bigram == nil {
+		return nil, false
+	}
+	bounds, covered := c.bigram.RoutePhrase(terms, stats)
+	if !covered {
+		return nil, false
+	}
+	return bounds, true
+}
+
+// runQuery scores a fixed candidate set: it walks the shards in descending bound
+// order, seeds each shard's WAND with the running global k-th once the heap is full
+// (the M5 threshold sharing), stops when the next bound cannot beat the threshold,
+// and merges the per-shard hits into the global top-k. Both QueryWith and
+// QueryPhrase reach it, differing only in how they routed the candidate set.
+func (c *Cluster) runQuery(terms []string, k int, stats search.GlobalStats, bounds []search.ShardBound) ([]ClusterHit, QueryStats, error) {
 	qstats := QueryStats{Candidates: len(bounds)}
 
 	var cands []ClusterHit
