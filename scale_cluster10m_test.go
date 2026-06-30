@@ -50,6 +50,34 @@ import (
 // maxShards reads the optional shard cap. Zero means no cap.
 func maxShards() int { return envInt("TATAMI_MAX_SHARDS", 0) }
 
+// filesPerShard groups this many Parquet files into one shard. One file per shard
+// (the default) is the finest split, but the routing index replicates every common
+// term across every shard, so its resident footprint grows with the shard count:
+// at one file per shard the unigram routing for a 500-file corpus runs to several
+// gigabytes, more than a box with tens of GB can hold next to the segment cache.
+// Grouping files into coarser shards is the scale/12 repackaging lever: it collapses
+// that replication (a term common to every file now has one posting per group, not
+// per file) at the cost of a longer per-shard posting walk, which the bound walk and
+// threshold sharing keep bounded. The 10M run sets this so the routing index fits.
+func filesPerShard() int { return envInt("TATAMI_FILES_PER_SHARD", 1) }
+
+// chunkFiles groups paths into runs of up to per files, preserving order, so each
+// run becomes one shard.
+func chunkFiles(paths []string, per int) [][]string {
+	if per < 1 {
+		per = 1
+	}
+	var groups [][]string
+	for i := 0; i < len(paths); i += per {
+		hi := i + per
+		if hi > len(paths) {
+			hi = len(paths)
+		}
+		groups = append(groups, paths[i:hi])
+	}
+	return groups
+}
+
 // buildWorkers is the build concurrency. Each in-flight worker holds a shard's
 // builder resident, and a shard builder with bigram capture on is the memory peak
 // of the whole run, so this stays small by default to fit a box with tens of GB
@@ -126,6 +154,21 @@ var (
 // of WET text and query latency touches only the index.
 func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 	shardedOnce.Do(func() {
+		// A persistent segment directory splits the slow build from the cheap
+		// measurement: build once into TATAMI_SEG_DIR, persisting the segments, the
+		// routing index, and the bigram sidecar, then re-open them on later runs
+		// without rebuilding. The build can grind for hours at low priority on a busy
+		// box while the latency pass re-runs in seconds whenever the box has a quiet
+		// window. With no segment directory set the build goes to a temp dir and is
+		// not reused.
+		segDir := os.Getenv("TATAMI_SEG_DIR")
+		if segDir != "" {
+			if c, docs, ok := loadPersistedCluster(tb, segDir); ok {
+				shardedC, shardedDocs = c, docs
+				return
+			}
+		}
+
 		dir := wetDir()
 		matches, err := filepath.Glob(filepath.Join(dir, "*.parquet"))
 		if err != nil || len(matches) == 0 {
@@ -133,19 +176,29 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 			return
 		}
 		sort.Strings(matches)
-		if cap := maxShards(); cap > 0 && cap < len(matches) {
-			matches = matches[:cap]
+		per := filesPerShard()
+		// A shard cap bounds the work for a smoke run. It caps the number of shards,
+		// so it consumes at most cap*per input files.
+		if cap := maxShards(); cap > 0 && cap*per < len(matches) {
+			matches = matches[:cap*per]
 		}
+		groups := chunkFiles(matches, per)
 
-		tmp, err := os.MkdirTemp("", "tatami-cluster10m-")
-		if err != nil {
+		tmp := segDir
+		if tmp == "" {
+			tmp, err = os.MkdirTemp("", "tatami-cluster10m-")
+			if err != nil {
+				shardedErr = err
+				return
+			}
+		} else if err := os.MkdirAll(tmp, 0o755); err != nil {
 			shardedErr = err
 			return
 		}
 
 		t0 := nowMono()
-		paths := make([]string, len(matches))
-		counts := make([]int, len(matches))
+		paths := make([]string, len(groups))
+		counts := make([]int, len(groups))
 		bb := search.NewBigramRoutingBuilder()
 		keep := targetPairs()
 		var mu sync.Mutex // guards bb folding, the done counter, and firstErr
@@ -160,14 +213,23 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 				defer wg.Done()
 				for i := range jobs {
 					b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true})
-					n, err := eachWETFile(matches[i], math.MaxInt32, func(d SearchDoc) { b.Add(d) })
+					var n int
+					var err error
+					for _, f := range groups[i] {
+						got, ferr := eachWETFile(f, math.MaxInt32, func(d SearchDoc) { b.Add(d) })
+						n += got
+						if ferr != nil {
+							err = ferr
+							break
+						}
+					}
 					if err == nil {
 						err = b.Write(filepath.Join(tmp, fmt.Sprintf("seg-%05d.tatami", i)), WriterOptions{})
 					}
 					mu.Lock()
 					if err != nil {
 						if firstErr == nil {
-							firstErr = fmt.Errorf("shard %d (%s): %w", i, matches[i], err)
+							firstErr = fmt.Errorf("shard %d (%v): %w", i, groups[i], err)
 						}
 						mu.Unlock()
 						continue
@@ -181,19 +243,21 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 					bb.AddShard(uint32(i), keptBigrams{src: b, keep: keep})
 					done++
 					if done%50 == 0 {
-						tb.Logf("built %d/%d shards, %v elapsed", done, len(matches), nowMono().Sub(t0).Round(time.Second))
+						tb.Logf("built %d/%d shards, %v elapsed", done, len(groups), nowMono().Sub(t0).Round(time.Second))
 					}
 					mu.Unlock()
 				}
 			}()
 		}
-		for i := range matches {
+		for i := range groups {
 			jobs <- i
 		}
 		close(jobs)
 		wg.Wait()
 		if firstErr != nil {
-			_ = os.RemoveAll(tmp)
+			if segDir == "" {
+				_ = os.RemoveAll(tmp)
+			}
 			shardedErr = firstErr
 			return
 		}
@@ -212,13 +276,25 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 		cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
 		c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
 		if err != nil {
-			_ = os.RemoveAll(tmp)
 			shardedErr = err
 			return
 		}
+		bigram := bb.Build()
 		tb.Logf("built %d shards, %d docs, %d terms in routing, %v",
 			c.NumShards(), c.NumDocs(), c.Routing().NumTerms(), nowMono().Sub(t0).Round(time.Second))
-		shardedC = c.WithBigramRouting(bb.Build())
+
+		// Persist the routing index and bigram sidecar next to the segments so a later
+		// run re-opens the cluster without rebuilding. Failure here is not fatal: the
+		// in-memory cluster is already good for this run, only the reuse is lost.
+		if segDir != "" {
+			if werr := os.WriteFile(filepath.Join(segDir, "routing.bin"), search.EncodeRouting(c.Routing()), 0o644); werr != nil {
+				tb.Logf("warning: persist routing: %v", werr)
+			}
+			if werr := os.WriteFile(filepath.Join(segDir, "bigram.bin"), search.EncodeBigramRouting(bigram), 0o644); werr != nil {
+				tb.Logf("warning: persist bigram: %v", werr)
+			}
+		}
+		shardedC = c.WithBigramRouting(bigram)
 	})
 	if shardedSkip != "" {
 		tb.Skip(shardedSkip)
@@ -227,6 +303,42 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 		tb.Fatal(shardedErr)
 	}
 	return shardedC, shardedDocs
+}
+
+// loadPersistedCluster re-opens a cluster a prior build persisted into segDir: the
+// seg-*.tatami shards plus the encoded routing index and bigram sidecar. It returns
+// ok false when the directory has no persisted build yet, so the caller falls
+// through to building one. This is what lets the slow build run once and the
+// latency pass re-run cheaply.
+func loadPersistedCluster(tb testing.TB, segDir string) (*Cluster, int, bool) {
+	paths, err := filepath.Glob(filepath.Join(segDir, "seg-*.tatami"))
+	if err != nil || len(paths) == 0 {
+		return nil, 0, false
+	}
+	routingBytes, err := os.ReadFile(filepath.Join(segDir, "routing.bin"))
+	if err != nil {
+		return nil, 0, false
+	}
+	bigramBytes, err := os.ReadFile(filepath.Join(segDir, "bigram.bin"))
+	if err != nil {
+		return nil, 0, false
+	}
+	sort.Strings(paths)
+	routing, err := search.DecodeRouting(routingBytes)
+	if err != nil {
+		tb.Fatalf("decode persisted routing: %v", err)
+	}
+	bigram, err := search.DecodeBigramRouting(bigramBytes)
+	if err != nil {
+		tb.Fatalf("decode persisted bigram: %v", err)
+	}
+	if routing.NumShards() != len(paths) {
+		tb.Fatalf("persisted routing has %d shards but %d segments on disk", routing.NumShards(), len(paths))
+	}
+	cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
+	c := OpenClusterWithRouting(paths, routing, ClusterOptions{CacheSize: cache}).WithBigramRouting(bigram)
+	tb.Logf("reopened %d shards, %d docs from %s", c.NumShards(), c.NumDocs(), segDir)
+	return c, routing.NumDocs(), true
 }
 
 // TestClusterScale10M builds the sharded corpus and enforces the headline claim:
