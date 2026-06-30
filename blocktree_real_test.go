@@ -22,7 +22,12 @@ import (
 // its sorted term list. It skips when the shard is absent.
 func realTerms(tb testing.TB) []search.Term {
 	seg := loadRealSegment(tb)
-	return seg.Inverted().Dict().Terms()
+	var terms []search.Term
+	seg.Inverted().Dict().PrefixScan("", func(t string, e search.Entry) bool {
+		terms = append(terms, search.Term{Term: t, Entry: e})
+		return true
+	})
+	return terms
 }
 
 // sortedDictResidentBytes estimates the heap a SortedDict holds: every term

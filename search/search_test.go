@@ -281,7 +281,8 @@ func TestInvertedBuildSearchRoundTrip(t *testing.T) {
 	}
 
 	td, pp, sk := EncodeInverted(inv)
-	got, err := DecodeInverted(td, pp, sk, inv.NumDocs())
+	// EncodeInverted now emits the block-tree term run, so decode through that path.
+	got, err := DecodeInverted(td, pp, sk, inv.NumDocs(), true)
 	if err != nil {
 		t.Fatal(err)
 	}

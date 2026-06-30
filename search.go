@@ -382,7 +382,8 @@ func OpenSearch(path string) (*SearchSegment, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	inv, err := search.DecodeInverted(td, pp, sk, int(d.numDocs))
+	blockTree := r.header.Flags&FlagBlockTreeDict != 0
+	inv, err := search.DecodeInverted(td, pp, sk, int(d.numDocs), blockTree)
 	if err != nil {
 		_ = f.Close()
 		return nil, err
