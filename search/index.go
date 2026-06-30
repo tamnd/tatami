@@ -81,7 +81,7 @@ func (b *InvertedBuilder) Build() (*Inverted, error) {
 			PostingOffset: int64(idx),
 		}})
 	}
-	return &Inverted{dict: NewSortedDict(termList), lists: lists, numDocs: b.numDocs, live: NewLive(b.numDocs)}, nil
+	return &Inverted{dict: NewSortedDict(termList), lists: eagerLists(lists), numDocs: b.numDocs, live: NewLive(b.numDocs)}, nil
 }
 
 // Inverted is an immutable, queryable inverted index: a term dictionary, the
@@ -90,7 +90,7 @@ func (b *InvertedBuilder) Build() (*Inverted, error) {
 // safe for concurrent readers but not for a reader racing a Delete.
 type Inverted struct {
 	dict    *SortedDict
-	lists   []*List
+	lists   listStore
 	numDocs int
 	live    *Live
 }
@@ -185,10 +185,10 @@ func (inv *Inverted) Postings(term string) (*Cursor, int, bool) {
 		}
 		return l.Cursor(), 1, true
 	}
-	if e.PostingOffset < 0 || int(e.PostingOffset) >= len(inv.lists) {
+	if e.PostingOffset < 0 || int(e.PostingOffset) >= inv.lists.len() {
 		return nil, 0, false
 	}
-	return inv.lists[e.PostingOffset].Cursor(), e.DocFreq, true
+	return inv.lists.at(int(e.PostingOffset)).Cursor(), e.DocFreq, true
 }
 
 // MaxFreq returns a term's maximum in-document frequency, the input to its WAND
@@ -201,10 +201,10 @@ func (inv *Inverted) MaxFreq(term string) uint32 {
 	if e.Singleton {
 		return e.SingletonFreq
 	}
-	if int(e.PostingOffset) >= len(inv.lists) {
+	if int(e.PostingOffset) >= inv.lists.len() {
 		return 0
 	}
-	return inv.lists[e.PostingOffset].MaxFreq()
+	return inv.lists.at(int(e.PostingOffset)).MaxFreq()
 }
 
 // GlobalStats supplies the corpus-wide statistics that make a shard's scores
@@ -277,8 +277,8 @@ func (inv *Inverted) EachTerm(fn func(term string, df int, maxFreq uint32)) {
 		var mf uint32
 		if t.Entry.Singleton {
 			mf = t.Entry.SingletonFreq
-		} else if int(t.Entry.PostingOffset) < len(inv.lists) {
-			mf = inv.lists[t.Entry.PostingOffset].MaxFreq()
+		} else if int(t.Entry.PostingOffset) < inv.lists.len() {
+			mf = inv.lists.at(int(t.Entry.PostingOffset)).MaxFreq()
 		}
 		fn(t.Term, t.Entry.DocFreq, mf)
 	}
@@ -307,15 +307,18 @@ func EncodeInverted(inv *Inverted) (termDict, postings, skips []byte) {
 	}
 
 	// Posting payloads run.
-	pp := binary.AppendUvarint(nil, uint64(len(inv.lists)))
-	for _, l := range inv.lists {
+	nLists := inv.lists.len()
+	pp := binary.AppendUvarint(nil, uint64(nLists))
+	for i := range nLists {
+		l := inv.lists.at(i)
 		pp = binary.AppendUvarint(pp, uint64(len(l.data)))
 		pp = append(pp, l.data...)
 	}
 
 	// Skip tables run.
-	sk := binary.AppendUvarint(nil, uint64(len(inv.lists)))
-	for _, l := range inv.lists {
+	sk := binary.AppendUvarint(nil, uint64(nLists))
+	for i := range nLists {
+		l := inv.lists.at(i)
 		sk = binary.AppendUvarint(sk, uint64(l.numDoc))
 		sk = binary.AppendUvarint(sk, uint64(len(l.blocks)))
 		for _, b := range l.blocks {
@@ -334,50 +337,20 @@ func EncodeInverted(inv *Inverted) (termDict, postings, skips []byte) {
 // posting payload with its skip table by position, the same index the dictionary
 // entries reference.
 func DecodeInverted(termDict, postings, skips []byte, numDocs int) (*Inverted, error) {
-	// Posting payloads.
-	pc := &byteReader{b: postings}
-	nLists := int(pc.uvarint())
-	datas := make([][]byte, nLists)
-	for i := 0; i < nLists; i++ {
-		n := int(pc.uvarint())
-		datas[i] = pc.take(n)
-	}
-	if pc.err != nil {
-		return nil, fmt.Errorf("search: decode posting payloads: %w", pc.err)
-	}
-
-	// Skip tables, paired with the payloads.
-	sc := &byteReader{b: skips}
-	nSkip := int(sc.uvarint())
-	if nSkip != nLists {
-		return nil, fmt.Errorf("search: %d skip tables for %d posting lists", nSkip, nLists)
-	}
-	lists := make([]*List, nLists)
-	for i := 0; i < nLists; i++ {
-		l := &List{data: datas[i]}
-		l.numDoc = int(sc.uvarint())
-		nb := int(sc.uvarint())
-		l.blocks = make([]block, nb)
-		for j := 0; j < nb; j++ {
-			l.blocks[j] = block{
-				firstDoc: DocID(sc.uvarint()),
-				lastDoc:  DocID(sc.uvarint()),
-				maxFreq:  uint32(sc.uvarint()),
-				offset:   int(sc.uvarint()),
-				count:    int(sc.uvarint()),
-			}
-		}
-		lists[i] = l
-	}
-	if sc.err != nil {
-		return nil, fmt.Errorf("search: decode skip tables: %w", sc.err)
+	// Posting payloads and skip tables stay as their raw runs; the lazy store
+	// scans them once to find each list's offset and decodes a list only when a
+	// query asks for it (scale/04, lever 2). This is the heap win: the eager
+	// decode held the whole block array resident, ~22 MiB on a real shard.
+	lists, err := newLazyLists(postings, skips)
+	if err != nil {
+		return nil, err
 	}
 
 	// Term dictionary.
 	tc := &byteReader{b: termDict}
 	nTerms := int(tc.uvarint())
 	termList := make([]Term, 0, nTerms)
-	for i := 0; i < nTerms; i++ {
+	for range nTerms {
 		tl := int(tc.uvarint())
 		term := string(tc.take(tl))
 		e := Entry{DocFreq: int(tc.uvarint())}
