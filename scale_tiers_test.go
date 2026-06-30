@@ -133,12 +133,21 @@ func buildTierSegment(tb testing.TB, limit int) (seg *SearchSegment, build time.
 	// builder does not hold gigabytes of WET text resident. Query latency, the
 	// thing the <10ms gate measures, touches only the inverted index, so this is
 	// the faithful configuration for the scale claim.
+	//
+	// The segment is built through the streaming external-merge writer (scale/06,
+	// M3), the production path at scale: it spills sorted runs at a byte budget and
+	// k-way merges them, so build memory stays bounded by the batch budget instead
+	// of holding the whole posting map resident. The in-memory builder cannot reach
+	// the 1M and 10M tiers on this box; the streaming builder can.
 	t0 := nowMono()
-	b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true})
-	for _, d := range docs {
-		b.Add(d)
+	sb, err := NewStreamingSearchBuilder(path, tmp, StreamingOptions{Snippet: true})
+	if err != nil {
+		tb.Fatal(err)
 	}
-	if err := b.Write(path, WriterOptions{}); err != nil {
+	for _, d := range docs {
+		sb.Add(d)
+	}
+	if err := sb.Close(); err != nil {
 		tb.Fatal(err)
 	}
 	build = nowMono().Sub(t0)
