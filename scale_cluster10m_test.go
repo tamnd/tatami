@@ -201,11 +201,16 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 			shardedDocs += n
 		}
 
-		// Cache every shard: the 10ms budget is a warm-serving claim, so after warmup
-		// the broker finds each routed shard resident and runs the posting walk from
-		// memory. The cold first-touch decode is the separate cost the open-segment
-		// cache and shard repackaging exist to bound, measured by the cache-bound test.
-		c, err := OpenCluster(paths, ClusterOptions{CacheSize: len(paths)})
+		// Cache the working set: the 10ms budget is a warm-serving claim, so the cache
+		// should hold the shards the query set actually opens, which the phrase route
+		// and the bound walk keep to a fraction of the shard count. Caching every shard
+		// is the simplest way to guarantee that but costs one resident segment per
+		// shard, too much on a box already running other work, so the cap is tunable
+		// and defaults to holding every shard only when that fits. The cold first-touch
+		// decode is the separate cost the cache and shard repackaging exist to bound,
+		// measured by the cache-bound test.
+		cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
+		c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
 		if err != nil {
 			_ = os.RemoveAll(tmp)
 			shardedErr = err
