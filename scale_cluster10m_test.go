@@ -43,6 +43,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -169,12 +170,39 @@ var (
 // temp dir and is not reused.
 func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 	shardedOnce.Do(func() {
+		segDir := os.Getenv("TATAMI_SEG_DIR")
+		measureOnly := os.Getenv("TATAMI_MEASURE_ONLY") != ""
+
 		dir := wetDir()
-		matches, err := filepath.Glob(filepath.Join(dir, "*.parquet"))
-		if err != nil || len(matches) == 0 {
-			shardedSkip = fmt.Sprintf("WET corpus unavailable (%v); set TATAMI_WET_DIR to run", err)
+		matches, gerr := filepath.Glob(filepath.Join(dir, "*.parquet"))
+		noCorpus := gerr != nil || len(matches) == 0
+
+		// Measure-only fast path: reopen an already-built segment directory without
+		// touching the WET corpus. Forced with TATAMI_MEASURE_ONLY, or taken
+		// automatically when the corpus is gone but a full set of segments is on disk,
+		// which is the case after the segments are copied to a quiet, idle box to take
+		// the warm latency reading off the busy build box. It rebuilds the routing
+		// index from the segment dictionaries and folds the per-shard sidecars, so it
+		// yields the same cluster a fresh build does, on a box that never saw the 41GB
+		// corpus.
+		if segDir != "" && (measureOnly || noCorpus) {
+			c, docs, rerr := reopenSegmentCluster(segDir)
+			if rerr == nil {
+				tb.Logf("measure-only: reopened %d shards, %d docs from %s", c.NumShards(), docs, segDir)
+				shardedC, shardedDocs = c, docs
+				return
+			}
+			if measureOnly {
+				shardedErr = fmt.Errorf("measure-only reopen of %s failed: %w", segDir, rerr)
+				return
+			}
+			// Fall through: no corpus and no usable segments, so skip below.
+		}
+		if noCorpus {
+			shardedSkip = fmt.Sprintf("WET corpus unavailable (%v); set TATAMI_WET_DIR to run", gerr)
 			return
 		}
+
 		sort.Strings(matches)
 		per := filesPerShard()
 		// A shard cap bounds the work for a smoke run. It caps the number of shards,
@@ -184,15 +212,15 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 		}
 		groups := chunkFiles(matches, per)
 
-		segDir := os.Getenv("TATAMI_SEG_DIR")
 		tmp := segDir
 		cleanup := false
 		if tmp == "" {
-			tmp, err = os.MkdirTemp("", "tatami-cluster10m-")
+			t, err := os.MkdirTemp("", "tatami-cluster10m-")
 			if err != nil {
 				shardedErr = err
 				return
 			}
+			tmp = t
 			cleanup = true
 		} else if err := os.MkdirAll(tmp, 0o755); err != nil {
 			shardedErr = err
@@ -313,6 +341,41 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 		tb.Fatal(shardedErr)
 	}
 	return shardedC, shardedDocs
+}
+
+// reopenSegmentCluster builds a broker from the segments already in segDir, with no
+// WET corpus in hand. It rebuilds the routing index from the segment dictionaries
+// (OpenCluster) and folds each shard's persisted adjacency sidecar, the same cluster
+// a fresh build yields. It is how the warm latency reading moves off the busy build
+// box: copy the seg-*.tatami and seg-*.bgr files to an idle box and reopen them.
+func reopenSegmentCluster(segDir string) (*Cluster, int, error) {
+	paths, err := filepath.Glob(filepath.Join(segDir, "seg-*.tatami"))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(paths) == 0 {
+		return nil, 0, fmt.Errorf("no segments in %s", segDir)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		if !fileExists(strings.TrimSuffix(p, ".tatami") + ".bgr") {
+			return nil, 0, fmt.Errorf("segment %s has no bigram sidecar", filepath.Base(p))
+		}
+	}
+	cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
+	c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
+	if err != nil {
+		return nil, 0, err
+	}
+	bb := search.NewBigramRoutingBuilder()
+	for i, p := range paths {
+		src, err := readBigramSidecar(strings.TrimSuffix(p, ".tatami") + ".bgr")
+		if err != nil {
+			return nil, 0, err
+		}
+		bb.AddShard(uint32(i), src)
+	}
+	return c.WithBigramRouting(bb.Build()), c.NumDocs(), nil
 }
 
 // fileExists reports whether path is a present, non-empty regular file.
