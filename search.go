@@ -505,6 +505,16 @@ func (s *SearchSegment) SearchTermsWith(terms []string, k int, stats search.Glob
 	return s.inv.SearchWith(terms, k, stats)
 }
 
+// SearchTermsSeeded is SearchTermsWith carrying a cross-shard score floor: the
+// broker passes its running k-th best score so this shard prunes documents that
+// cannot enter the global top-k before it scores them. A seed of 0 is identical to
+// SearchTermsWith. The exactness of the merged top-k is preserved because a valid
+// seed is a lower bound on the final global k-th, so no document the answer needs
+// is ever pruned (scale/07, M5).
+func (s *SearchSegment) SearchTermsSeeded(terms []string, k int, stats search.GlobalStats, seed search.Score) []search.Hit {
+	return s.inv.SearchSeeded(terms, k, stats, seed)
+}
+
 // Search runs the top-k retrieval and then fetches the url and title of each
 // surviving document from the forward columns, the full query-to-results path.
 func (s *SearchSegment) Search(query string, k int) ([]SearchResult, error) {

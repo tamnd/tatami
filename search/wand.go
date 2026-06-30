@@ -74,6 +74,27 @@ func WAND(terms []TermInput, k int) []Hit {
 // block holding only deleted documents simply is not skipped, a small cost paid
 // only when deletes are present.
 func WANDFilter(terms []TermInput, k int, keep func(DocID) bool) []Hit {
+	return WANDFilterSeeded(terms, k, keep, 0)
+}
+
+// WANDFilterSeeded is WANDFilter that starts from a non-zero score floor: a
+// document whose contribution cannot exceed seed is skipped from the very first
+// pivot, before this shard has scored anything. The seed is the cross-shard
+// threshold the broker carries (scale/07, M5): once earlier shards have filled the
+// global top-k, their k-th best score is a true lower bound on the final global
+// k-th, because adding more candidates can only raise it. A document scoring at or
+// below that floor cannot enter the global top-k under any tie-break, so skipping
+// it here is exact for the merged result. Any document this shard does return still
+// scores above the floor, so it is a superset-safe contribution: the broker's final
+// sort picks the same global top-k it would have with seed zero, only this shard
+// did less work to get there.
+//
+// The floor never suppresses a document the global answer needs: a document with
+// score strictly above the final global k-th has a bound at least its score, which
+// is above seed, so it is never skipped. The effective threshold the loop prunes
+// against is max(seed, this shard's own k-th), so a shard that finds strong local
+// hits tightens past the seed on its own.
+func WANDFilterSeeded(terms []TermInput, k int, keep func(DocID) bool, seed Score) []Hit {
 	if k <= 0 || len(terms) == 0 {
 		return nil
 	}
@@ -98,18 +119,25 @@ func WANDFilter(terms []TermInput, k int, keep func(DocID) bool) []Hit {
 		if len(live) == 0 {
 			break
 		}
-		// Find the pivot: the first term whose cumulative upper bound exceeds the
-		// threshold. Documents below the pivot's doc cannot reach the top-k.
-		pivot := findPivot(live, threshold)
+		// Find the pivot: the first term whose cumulative upper bound makes a
+		// document competitive. A document is competitive when its bound strictly
+		// beats this shard's own k-th (threshold) AND reaches the cross-shard seed.
+		// The threshold comparison stays strict, the seed comparison is inclusive:
+		// a document scoring exactly the seed must survive, because the seed is only
+		// a lower bound on the final global k-th and that document can still win the
+		// global tie-break against an equal-scoring document in another shard. A seed
+		// of 0 collapses this back to plain WAND (every bound is >= 0).
+		pivot := findPivotSeeded(live, threshold, seed)
 		if pivot < 0 {
 			break // no document can beat the threshold; done
 		}
 		pivotDoc := live[pivot].doc
 
 		if live[0].doc == pivotDoc {
-			// Block-max refinement: if the block-level bound at pivotDoc cannot beat
-			// the threshold, skip past the shallowest block end instead of scoring.
-			if blockMaxSum(live, pivotDoc) <= threshold && threshold > 0 {
+			// Block-max refinement: skip the block when its tighter bound cannot
+			// produce a competitive document, by either test, the local k-th (strict)
+			// or the cross-shard seed (strict-below, so an exact-seed block is kept).
+			if bms := blockMaxSum(live, pivotDoc); (threshold > 0 && bms <= threshold) || (seed > 0 && bms < seed) {
 				skipBlock(live, pivotDoc)
 				continue
 			}
@@ -146,13 +174,19 @@ func liveSorted(states []*termState) []*termState {
 	return live
 }
 
-// findPivot returns the index in the doc-sorted live terms where the cumulative
-// global upper bound first exceeds threshold, or -1 if it never does.
-func findPivot(live []*termState, threshold Score) int {
+// findPivotSeeded returns the index in the doc-sorted live terms where the
+// cumulative global upper bound first makes a document competitive, or -1 if it
+// never does. A document is competitive when its bound both strictly exceeds the
+// local k-th threshold and reaches the cross-shard seed. The seed test is inclusive
+// (>= seed) while the threshold test is strict (> threshold), so a document whose
+// bound lands exactly on the seed still survives, which is what keeps the merged
+// top-k exact across shards when documents tie at the global k-th score. With seed
+// 0 the seed test is always satisfied and this is plain WAND pivoting.
+func findPivotSeeded(live []*termState, threshold, seed Score) int {
 	var sum Score
 	for i, ts := range live {
 		sum += ts.maxScore
-		if sum > threshold {
+		if sum > threshold && sum >= seed {
 			return i
 		}
 	}
