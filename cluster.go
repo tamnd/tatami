@@ -42,6 +42,11 @@ type Cluster struct {
 	paths   []string
 	routing *search.RoutingIndex
 	cache   *segCache
+	// noSeed disables cross-shard threshold sharing (scale/07, M5). It exists only
+	// so a benchmark can measure the same routed query with and without the seed; in
+	// production the seed is always on, since it cannot change the result, only the
+	// per-shard work.
+	noSeed bool
 }
 
 // ClusterOptions tunes a Cluster. CacheSize caps how many segments stay open at
@@ -142,12 +147,22 @@ func (c *Cluster) QueryWith(query string, k int, stats search.GlobalStats) ([]Cl
 		if th.full() && sb.Bound < th.min() {
 			break
 		}
+		// Cross-shard threshold sharing (scale/07, M5): once the broker has filled
+		// the global top-k, its running k-th best is a true lower bound on the final
+		// global k-th, so it seeds this shard's WAND. The shard then prunes documents
+		// that cannot beat the global threshold before it scores them, doing less work
+		// for the same merged result. Zero until the heap is full, which is the
+		// unseeded path for the first shards.
+		var seed search.Score
+		if th.full() && !c.noSeed {
+			seed = th.min()
+		}
 		h, err := c.cache.acquire(int(sb.Shard))
 		if err != nil {
 			return nil, qstats, err
 		}
 		qstats.Visited++
-		for _, hit := range h.seg.SearchTermsWith(terms, k, stats) {
+		for _, hit := range h.seg.SearchTermsSeeded(terms, k, stats, seed) {
 			cands = append(cands, ClusterHit{Shard: int(sb.Shard), Doc: uint32(hit.Doc), Score: float32(hit.Score)})
 			th.push(hit.Score)
 		}
@@ -202,15 +217,25 @@ func (c *Cluster) SearchWith(query string, k int, stats search.GlobalStats) ([]S
 
 	best := make(map[string]clusterCand)
 	for _, sb := range bounds {
-		if th, ok := kthDistinct(best, k); ok && sb.Bound < th {
-			break
+		var seed search.Score
+		if th, ok := kthDistinct(best, k); ok {
+			if sb.Bound < th {
+				break
+			}
+			// Seed this shard with the running k-th best distinct score (scale/07, M5).
+			// The over-fetch and dedup are unchanged: the seed only floors the per-shard
+			// WAND at a score the global answer already clears, so a dropped duplicate
+			// cannot uncover a needed result that scored below it.
+			if !c.noSeed {
+				seed = search.Score(th)
+			}
 		}
 		h, err := c.cache.acquire(int(sb.Shard))
 		if err != nil {
 			return nil, qstats, err
 		}
 		qstats.Visited++
-		for _, hit := range h.seg.SearchTermsWith(terms, perShard, stats) {
+		for _, hit := range h.seg.SearchTermsSeeded(terms, perShard, stats, seed) {
 			id, err := h.seg.globalDocID(uint32(hit.Doc))
 			if err != nil {
 				c.cache.release(h)

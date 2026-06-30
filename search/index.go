@@ -249,6 +249,19 @@ func (inv *Inverted) Search(terms []string, k int) []Hit {
 // term contributes to its WAND upper bound stays shard-local, because it bounds
 // the frequencies in this shard's own postings; only the IDF goes global.
 func (inv *Inverted) SearchWith(terms []string, k int, stats GlobalStats) []Hit {
+	return inv.SearchSeeded(terms, k, stats, 0)
+}
+
+// SearchSeeded is SearchWith carrying a cross-shard score floor: documents whose
+// contribution cannot exceed seed are pruned from the first pivot, before this
+// shard scores anything. A broker fills the global top-k from the highest-bound
+// shards first and then passes its running k-th best as the seed to every later
+// shard, so each later shard prunes against a real lower bound on the final answer
+// instead of starting cold at zero (scale/07, M5). A seed of 0 is the unseeded
+// path, byte-for-byte the same work SearchWith did before. The merged top-k is
+// unchanged: a document the global answer needs scores above the final global
+// k-th, hence above any valid seed, so it is never pruned here.
+func (inv *Inverted) SearchSeeded(terms []string, k int, stats GlobalStats, seed Score) []Hit {
 	col := Collection{N: inv.numDocs}
 	if stats != nil {
 		col = Collection{N: stats.NumDocs()}
@@ -270,11 +283,12 @@ func (inv *Inverted) SearchWith(terms []string, k int, stats GlobalStats) []Hit 
 		})
 	}
 	// When nothing is deleted, take the plain path so the common case pays no
-	// per-document liveness check.
+	// per-document liveness check. The seed still applies: a nil keep predicate is
+	// the no-deletes fast path inside the seeded loop.
 	if inv.live == nil || inv.live.AllLive() {
-		return WAND(inputs, k)
+		return WANDFilterSeeded(inputs, k, nil, seed)
 	}
-	return WANDFilter(inputs, k, func(d DocID) bool { return inv.live.Get(int(d)) })
+	return WANDFilterSeeded(inputs, k, func(d DocID) bool { return inv.live.Get(int(d)) }, seed)
 }
 
 // EachTerm calls fn for every term in the dictionary with its document frequency
