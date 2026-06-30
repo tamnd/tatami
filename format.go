@@ -46,6 +46,13 @@ const (
 	FlagHasDictRegion  uint16 = 1 << 2
 	FlagHasIndexRegion uint16 = 1 << 3
 	FlagRoleSearchSeg  uint16 = 1 << 4
+	// FlagBlockTreeDict marks a search segment whose term-dictionary run is the
+	// on-disk block tree (scale/03, M0) rather than the original flat uvarint list.
+	// A reader uses it to pick the decode path; segments written before M0 leave it
+	// clear and are read with the legacy flat decoder. The first byte of a block
+	// tree (its version) collides with a small flat-format term count, so the bit
+	// is the unambiguous discriminator rather than sniffing the run bytes.
+	FlagBlockTreeDict uint16 = 1 << 5
 )
 
 // LogicalType is the type of the values in a column. The enum values are pinned

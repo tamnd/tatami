@@ -89,10 +89,18 @@ func (b *InvertedBuilder) Build() (*Inverted, error) {
 // posting lists are immutable; only the live bitset mutates, on a delete. It is
 // safe for concurrent readers but not for a reader racing a Delete.
 type Inverted struct {
-	dict    *SortedDict
+	dict    Dictionary
 	lists   listStore
 	numDocs int
 	live    *Live
+}
+
+// eachTerm walks every dictionary entry in ascending term order. It is the seam-
+// generic form of SortedDict.Terms(): a prefix scan with an empty prefix visits
+// every term, so the builder's resident SortedDict and a decoded segment's on-disk
+// block tree both enumerate without materializing the whole term list (scale/03).
+func eachTerm(d Dictionary, fn func(term string, e Entry) bool) {
+	d.PrefixScan("", fn)
 }
 
 // NumDocs returns the dense doc-id space size N, the input to IDF. It counts
@@ -144,10 +152,10 @@ func (inv *Inverted) SetLive(l *Live) { inv.live = l }
 // documents are omitted, so the merged segment reclaims their space.
 func (inv *Inverted) PerDocFreqs() []map[string]uint32 {
 	perDoc := make([]map[string]uint32, inv.numDocs)
-	for _, t := range inv.dict.Terms() {
-		cur, _, ok := inv.Postings(t.Term)
+	eachTerm(inv.dict, func(term string, _ Entry) bool {
+		cur, _, ok := inv.Postings(term)
 		if !ok {
-			continue
+			return true
 		}
 		for cur.Next() {
 			d := int(cur.Doc())
@@ -157,17 +165,20 @@ func (inv *Inverted) PerDocFreqs() []map[string]uint32 {
 			if perDoc[d] == nil {
 				perDoc[d] = make(map[string]uint32)
 			}
-			perDoc[d][t.Term] = cur.Freq()
+			perDoc[d][term] = cur.Freq()
 		}
-	}
+		return true
+	})
 	return perDoc
 }
 
 // NumTerms returns the number of distinct terms.
 func (inv *Inverted) NumTerms() int { return inv.dict.Len() }
 
-// Dict exposes the term dictionary for prefix and range scans.
-func (inv *Inverted) Dict() *SortedDict { return inv.dict }
+// Dict exposes the term dictionary for prefix and range scans. It is the seam
+// type, so a decoded segment can hand back the on-disk block tree and a builder
+// can hand back the resident SortedDict behind the same interface.
+func (inv *Inverted) Dict() Dictionary { return inv.dict }
 
 // Postings returns a cursor over a term's posting list and its document
 // frequency, or ok=false when the term is absent. A singleton term is
@@ -273,15 +284,16 @@ func (inv *Inverted) SearchWith(terms []string, k int, stats GlobalStats) []Hit 
 // and skip tables, never a posting payload, so building a routing index over many
 // shards stays cheap.
 func (inv *Inverted) EachTerm(fn func(term string, df int, maxFreq uint32)) {
-	for _, t := range inv.dict.Terms() {
+	eachTerm(inv.dict, func(term string, e Entry) bool {
 		var mf uint32
-		if t.Entry.Singleton {
-			mf = t.Entry.SingletonFreq
-		} else if int(t.Entry.PostingOffset) < inv.lists.len() {
-			mf = inv.lists.at(int(t.Entry.PostingOffset)).MaxFreq()
+		if e.Singleton {
+			mf = e.SingletonFreq
+		} else if int(e.PostingOffset) < inv.lists.len() {
+			mf = inv.lists.at(int(e.PostingOffset)).MaxFreq()
 		}
-		fn(t.Term, t.Entry.DocFreq, mf)
-	}
+		fn(term, e.DocFreq, mf)
+		return true
+	})
 }
 
 // EncodeInverted serializes an inverted index into the three byte runs of the
@@ -290,21 +302,19 @@ func (inv *Inverted) EachTerm(fn func(term string, df int, maxFreq uint32)) {
 // hold the small, hot dictionary and skip tables resident while the large
 // posting payloads page in on demand (09-search-scale.md, section 4).
 func EncodeInverted(inv *Inverted) (termDict, postings, skips []byte) {
-	// Term dictionary run.
-	td := binary.AppendUvarint(nil, uint64(inv.dict.Len()))
-	for _, t := range inv.dict.Terms() {
-		td = binary.AppendUvarint(td, uint64(len(t.Term)))
-		td = append(td, t.Term...)
-		td = binary.AppendUvarint(td, uint64(t.Entry.DocFreq))
-		if t.Entry.Singleton {
-			td = append(td, 1)
-			td = binary.AppendUvarint(td, uint64(t.Entry.SingletonDoc))
-			td = binary.AppendUvarint(td, uint64(t.Entry.SingletonFreq))
-		} else {
-			td = append(td, 0)
-			td = binary.AppendUvarint(td, uint64(t.Entry.PostingOffset))
-		}
-	}
+	// Term dictionary run: the on-disk block tree (scale/03, M0). The entries are
+	// already in ascending order, which is what BuildBlockTree requires, so a
+	// decoded segment serves lookups from the block tree's sparse index instead of
+	// materializing every term string the way the old flat run forced.
+	terms := make([]Term, 0, inv.dict.Len())
+	eachTerm(inv.dict, func(t string, e Entry) bool {
+		terms = append(terms, Term{Term: t, Entry: e})
+		return true
+	})
+	// BuildBlockTree's only error path is zstd encoder initialization, a process-
+	// wide condition the codec also depends on; if it ever fires the term run is
+	// left empty and DecodeInverted reports it rather than the writer panicking.
+	td, _ := BuildBlockTree(terms, DefaultBlockTreeBlockSize)
 
 	// Posting payloads run.
 	nLists := inv.lists.len()
@@ -335,8 +345,12 @@ func EncodeInverted(inv *Inverted) (termDict, postings, skips []byte) {
 // DecodeInverted reconstructs an inverted index from the three runs that
 // EncodeInverted produced plus the segment's document count. It pairs each
 // posting payload with its skip table by position, the same index the dictionary
-// entries reference.
-func DecodeInverted(termDict, postings, skips []byte, numDocs int) (*Inverted, error) {
+// entries reference. blockTree selects the term-dictionary decoder: true for the
+// on-disk block tree this writer now emits (scale/03, M0), false for the legacy
+// flat uvarint run a pre-M0 segment carries. The caller reads the choice from the
+// segment header's FlagBlockTreeDict bit, never by sniffing the run bytes, because
+// the block-tree version byte collides with a small flat-format term count.
+func DecodeInverted(termDict, postings, skips []byte, numDocs int, blockTree bool) (*Inverted, error) {
 	// Posting payloads and skip tables stay as their raw runs; the lazy store
 	// scans them once to find each list's offset and decodes a list only when a
 	// query asks for it (scale/04, lever 2). This is the heap win: the eager
@@ -346,7 +360,30 @@ func DecodeInverted(termDict, postings, skips []byte, numDocs int) (*Inverted, e
 		return nil, err
 	}
 
-	// Term dictionary.
+	var dict Dictionary
+	if blockTree {
+		// The block tree keeps only a sparse index resident and pages each 64-term
+		// block in on demand, so opening a 20M-term segment no longer materializes
+		// every term string into the heap (scale/03).
+		bt, err := OpenBlockTree(termDict)
+		if err != nil {
+			return nil, fmt.Errorf("search: open block-tree dictionary: %w", err)
+		}
+		dict = bt
+	} else {
+		d, err := decodeFlatDict(termDict)
+		if err != nil {
+			return nil, err
+		}
+		dict = d
+	}
+	return &Inverted{dict: dict, lists: lists, numDocs: numDocs}, nil
+}
+
+// decodeFlatDict reads the original flat uvarint term-dictionary run into a
+// resident SortedDict. It is kept for segments written before M0 wired the block
+// tree into the format; new segments take the block-tree path in DecodeInverted.
+func decodeFlatDict(termDict []byte) (*SortedDict, error) {
 	tc := &byteReader{b: termDict}
 	nTerms := int(tc.uvarint())
 	termList := make([]Term, 0, nTerms)
@@ -366,7 +403,7 @@ func DecodeInverted(termDict, postings, skips []byte, numDocs int) (*Inverted, e
 	if tc.err != nil {
 		return nil, fmt.Errorf("search: decode term dictionary: %w", tc.err)
 	}
-	return &Inverted{dict: NewSortedDict(termList), lists: lists, numDocs: numDocs}, nil
+	return NewSortedDict(termList), nil
 }
 
 // byteReader is a tiny forward reader over a byte slice, the decode mirror of the

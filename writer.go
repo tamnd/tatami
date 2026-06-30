@@ -322,7 +322,10 @@ func (w *Writer) flags() uint16 {
 		fl |= FlagHasIndexRegion
 	}
 	if w.meta.invert.present {
-		fl |= FlagRoleSearchSeg
+		// Every search segment this writer emits carries the block-tree term
+		// dictionary (scale/03, M0), so the role bit and the block-tree bit travel
+		// together. The bit lets a reader tell these from pre-M0 flat-dict segments.
+		fl |= FlagRoleSearchSeg | FlagBlockTreeDict
 	}
 	return fl
 }
