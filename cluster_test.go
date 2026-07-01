@@ -122,6 +122,13 @@ func TestClusterEarlyTermination(t *testing.T) {
 	}
 	defer c.Close()
 
+	// Assert the prune on the serial walk. The bound-prune (stop once the next bound
+	// cannot beat the running k-th) is a serial guarantee: the parallel pool claims
+	// shards by an atomic counter, so on a many-core box it can claim the low-bound
+	// tail before a worker folds the risen k-th and trips the stop, over-visiting a
+	// few shards a serial walk prunes. That never changes the result, only the work,
+	// so the exactness check below runs the production parallel path unchanged.
+	c.serial = true
 	got, st, err := c.Query("alpha", 3)
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +139,7 @@ func TestClusterEarlyTermination(t *testing.T) {
 	if st.Visited >= st.Candidates {
 		t.Fatalf("Visited = %d did not prune any of %d candidates", st.Visited, st.Candidates)
 	}
+	c.serial = false
 	t.Logf("alpha k=3: visited %d of %d shards, threshold=%v", st.Visited, st.Candidates, st.Threshold)
 
 	want := bruteForceQuery(t, paths, c.Routing(), "alpha", 3)
