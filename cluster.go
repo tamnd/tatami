@@ -52,6 +52,13 @@ type Cluster struct {
 	// production the seed is always on, since it cannot change the result, only the
 	// per-shard work.
 	noSeed bool
+	// serial forces the fan-out to a single worker. It exists only so a test can assert
+	// the bound-prune invariant, which is a property of the serial walk: the parallel
+	// pool claims shards by an atomic counter, so on a many-core box it can claim the
+	// low-bound tail before a worker folds the risen k-th and trips the stop, over-
+	// visiting shards a serial walk would have pruned. That is an accepted latency
+	// trade, and it never changes the result, so production always runs the pool.
+	serial bool
 }
 
 // ClusterOptions tunes a Cluster. CacheSize caps how many segments stay open at
@@ -302,6 +309,9 @@ func (c *Cluster) runQuery(terms []string, k int, stats search.GlobalStats, boun
 	}
 	if workers > len(bounds) {
 		workers = len(bounds)
+	}
+	if c.serial {
+		workers = 1
 	}
 
 	loadKth := func() search.Score {
