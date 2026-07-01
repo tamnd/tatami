@@ -292,6 +292,52 @@ func TestClusterRoutingSidecarRoundtrip(t *testing.T) {
 	}
 }
 
+// TestClusterRoutingFileRoundtrip persists the routing index to a mmap-aliasable
+// routing.bin, reopens the cluster over it, and checks the mmap-backed broker
+// answers every query identically to the one that rebuilt the index in memory.
+// This is the off-heap load path (scale/11 lever three): the serving box maps the
+// file instead of paying the rebuild, and it must serve the same results.
+func TestClusterRoutingFileRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	paths := clusterCorpus(t, dir, []int{100, 50, 10, 1, 1, 1, 1})
+	c1, err := OpenCluster(paths, ClusterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	rpath := filepath.Join(dir, "routing.bin")
+	if err := c1.PersistRouting(rpath); err != nil {
+		t.Fatalf("PersistRouting: %v", err)
+	}
+
+	c2, err := OpenClusterWithRoutingFile(paths, rpath, ClusterOptions{})
+	if err != nil {
+		t.Fatalf("OpenClusterWithRoutingFile: %v", err)
+	}
+	defer c2.Close()
+
+	if c2.NumDocs() != c1.NumDocs() || c2.NumShards() != c1.NumShards() {
+		t.Fatalf("mmap broker totals differ: docs %d/%d shards %d/%d",
+			c2.NumDocs(), c1.NumDocs(), c2.NumShards(), c1.NumShards())
+	}
+	for _, query := range []string{"alpha", "common", "common alpha", "missingterm"} {
+		for _, k := range []int{1, 5, 20} {
+			a, _, err := c1.Query(query, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _, err := c2.Query(query, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameHits(a, b) {
+				t.Fatalf("query %q k=%d mmap broker differs:\n built %+v\n file  %+v", query, k, a, b)
+			}
+		}
+	}
+}
+
 func sameHits(a, b []ClusterHit) bool {
 	if len(a) != len(b) {
 		return false

@@ -98,8 +98,30 @@ func OpenClusterWithRouting(paths []string, routing *search.RoutingIndex, opts C
 	return c
 }
 
+// OpenClusterWithRoutingFile returns a broker over paths whose routing index is
+// memory-mapped from a routing.bin instead of rebuilt from the shard dictionaries
+// (scale/11 lever three). The serving box pays the file, not the tens-of-gigabytes
+// rebuild peak, which is what lets the routing exceed RAM at 100M and beyond. The
+// file must have been written by WriteRoutingFile over the same paths in the same
+// order, since shard ids are path indices, and the cluster's Close unmaps it.
+func OpenClusterWithRoutingFile(paths []string, routingPath string, opts ClusterOptions) (*Cluster, error) {
+	ri, err := search.OpenRoutingFile(routingPath)
+	if err != nil {
+		return nil, err
+	}
+	return OpenClusterWithRouting(paths, ri, opts), nil
+}
+
 // Routing exposes the routing index, for stats and for persisting the sidecar.
 func (c *Cluster) Routing() *search.RoutingIndex { return c.routing }
+
+// PersistRouting writes the cluster's routing index to path as a mmap-aliasable
+// routing.bin, so a later open can load it with OpenClusterWithRoutingFile instead
+// of rebuilding it. It is a thin wrapper the build pipeline calls after OpenCluster
+// has built the index once.
+func (c *Cluster) PersistRouting(path string) error {
+	return search.WriteRoutingFile(path, c.routing)
+}
 
 // WithBigramRouting attaches a phrase routing sidecar and returns the cluster for
 // chaining. It is the only way to enable the phrase path: with it, QueryPhrase
@@ -119,8 +141,18 @@ func (c *Cluster) NumShards() int { return len(c.paths) }
 // without opening a segment.
 func (c *Cluster) NumDocs() int { return c.routing.NumDocs() }
 
-// Close closes every segment still open in the cache.
-func (c *Cluster) Close() error { return c.cache.closeAll() }
+// Close closes every segment still open in the cache and unmaps the routing index
+// if it was loaded from a routing.bin. The routing Close is a no-op for an in-heap
+// index, so this is safe whichever way the cluster was opened.
+func (c *Cluster) Close() error {
+	err := c.cache.closeAll()
+	if c.routing != nil {
+		if rerr := c.routing.Close(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	return err
+}
 
 // CacheLen reports how many segments are currently resident, for tests and
 // metrics.

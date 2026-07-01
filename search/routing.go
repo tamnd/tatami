@@ -77,6 +77,23 @@ type RoutingIndex struct {
 	postMax   []uint32
 	shardDocs []int // live documents per shard, indexed by shard id
 	totalDocs int
+	// closeFn releases the memory map when the index was loaded from a routing.bin
+	// (routing_file.go, scale/11 lever three), and is nil for an in-heap index built
+	// or decoded into ordinary slices. The aliased columns point into the mapping, so
+	// they must not be used after Close.
+	closeFn func() error
+}
+
+// Close releases any resource the index holds. For an mmap-backed index it unmaps
+// the routing.bin, after which the columns must not be read. For an in-heap index
+// it is a no-op, so a caller can Close unconditionally.
+func (ri *RoutingIndex) Close() error {
+	if ri.closeFn == nil {
+		return nil
+	}
+	err := ri.closeFn()
+	ri.closeFn = nil
+	return err
 }
 
 // ShardBound names a shard the broker should consider and the upper bound on the
