@@ -54,7 +54,8 @@ import (
 // serializes internally, and a query touches each routed leaf once.
 type Aggregator struct {
 	leaves  []*Cluster
-	summary *search.RoutingIndex // routing index whose shards are leaves; also the fleet GlobalStats
+	summary *search.RoutingIndex  // routing index whose shards are leaves; also the fleet GlobalStats
+	bigram  *search.BigramRouting // phrase sidecar whose shards are leaves; nil unless every leaf has one
 }
 
 // OpenAggregator returns an aggregator over the given leaf clusters, building the
@@ -64,10 +65,28 @@ type Aggregator struct {
 // aggregator adds only the summary, the routed fan-out, and the merge.
 func OpenAggregator(leaves []*Cluster) *Aggregator {
 	srcs := make([]search.RoutingSource, len(leaves))
+	haveBigram := len(leaves) > 0
 	for i, l := range leaves {
 		srcs[i] = l.Routing()
+		if l.Bigram() == nil {
+			haveBigram = false
+		}
 	}
-	return &Aggregator{leaves: leaves, summary: search.BuildRouting(srcs)}
+	a := &Aggregator{leaves: leaves, summary: search.BuildRouting(srcs)}
+	// The box-level phrase summary is the same fold one structure up: each leaf's own
+	// phrase sidecar becomes one posting keyed by the leaf's id, so the top broker
+	// routes a phrase to the boxes holding its adjacency. It is built only when every
+	// leaf carries a sidecar, because a box with no sidecar cannot be proven to lack an
+	// adjacency, so skipping it would not be exact; without it the phrase path falls
+	// back to the bag route, which is always exact.
+	if haveBigram {
+		bb := search.NewBigramRoutingBuilder()
+		for i, l := range leaves {
+			bb.AddShard(uint32(i), l.Bigram())
+		}
+		a.bigram = bb.Build()
+	}
+	return a
 }
 
 // Stats exposes the fleet statistics, for callers that want to score or route with
@@ -133,6 +152,54 @@ func (a *Aggregator) Search(query string, k int) ([]SearchResult, AggStats, erro
 	}
 	terms := tokenize(query)
 	route := a.summary.RouteWith(terms, a.summary)
+	return a.scatter(query, k, route, false)
+}
+
+// SearchPhrase routes a phrase to the boxes holding one of its adjacencies on the
+// box-level phrase summary, fans out only to those boxes with each leaf routing the
+// phrase over its own shards, and merges. Where Search routes on the bag of the
+// phrase's words, which for common words unions into nearly every box, SearchPhrase
+// routes on the far rarer adjacency, so a common phrase prunes to a handful of boxes
+// the way it already prunes to a handful of shards within a box (M5 phrase routing),
+// one level up. It falls back to the bag route Search when no box-level phrase
+// summary is built or an adjacency is untracked, so the answer is never wrong, only
+// wider. The narrowing is exact at the box level: a box absent from the phrase route
+// holds no document with the adjacency, so it could hold no phrase match, and within
+// a routed box the leaf makes the same exact narrowing over its shards.
+func (a *Aggregator) SearchPhrase(query string, k int) ([]SearchResult, AggStats, error) {
+	if k <= 0 {
+		return nil, AggStats{}, nil
+	}
+	terms := tokenize(query)
+	route, ok := a.phraseRoute(terms)
+	if !ok {
+		return a.Search(query, k)
+	}
+	return a.scatter(query, k, route, true)
+}
+
+// phraseRoute returns the box-level phrase route and whether it is exact: it is exact
+// only when a box-level phrase summary was built (every leaf carried a sidecar) and
+// every adjacency in the phrase is tracked, so a box absent from the route provably
+// holds no matching document. Otherwise the caller falls back to the bag route.
+func (a *Aggregator) phraseRoute(terms []string) ([]search.ShardBound, bool) {
+	if a.bigram == nil {
+		return nil, false
+	}
+	bounds, covered := a.bigram.RoutePhrase(terms, a.summary)
+	if !covered {
+		return nil, false
+	}
+	return bounds, true
+}
+
+// scatter fans a query out to the routed leaves concurrently, each leaf scoring its
+// own shards against the fleet statistics, then merges the leaves' partial top-k
+// lists into one. phrase selects the leaf path: the phrase route into a leaf when the
+// query routed on the box-level adjacency summary, the bag route otherwise. The
+// fan-out is parallel so routing shrinks it without serializing it, and the merge is
+// the same total order a single broker uses so the fleet result is byte-identical.
+func (a *Aggregator) scatter(query string, k int, route []search.ShardBound, phrase bool) ([]SearchResult, AggStats, error) {
 	agg := AggStats{Leaves: len(a.leaves), LeavesVisited: len(route)}
 	if len(route) == 0 {
 		return nil, agg, nil
@@ -150,7 +217,14 @@ func (a *Aggregator) Search(query string, k int) ([]SearchResult, AggStats, erro
 		go func(i int) {
 			defer wg.Done()
 			leaf := a.leaves[route[i].Shard]
-			res, st, err := leaf.SearchWith(query, k, a.summary)
+			var res []SearchResult
+			var st QueryStats
+			var err error
+			if phrase {
+				res, st, err = leaf.SearchPhraseWith(query, k, a.summary)
+			} else {
+				res, st, err = leaf.SearchWith(query, k, a.summary)
+			}
 			outs[i] = leafOut{res: res, stats: st, err: err}
 		}(i)
 	}

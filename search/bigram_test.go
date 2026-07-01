@@ -131,6 +131,62 @@ func TestPhraseRouteSingleWord(t *testing.T) {
 	}
 }
 
+// TestBigramRoutingAsSource checks that a BigramRouting folds into a higher-level
+// bigram builder as one shard, the building block of the box-level phrase summary
+// (scale/11 lever four). A summary built over two per-box sidecars must report the
+// sum of a pair's per-box document frequency as its own df, and route a phrase to a
+// box using that box's ceiling adjacency frequency, the max over its shards, so a
+// box's phrase bound stays a true upper bound on any phrase score in the box.
+func TestBigramRoutingAsSource(t *testing.T) {
+	// Box 0: two shards, "open source" reaching maxFreq 3 then 7 across them, plus an
+	// adjacency "box zero" that lives only in this box.
+	box0 := buildBigrams([]fakeBigramShard{
+		{pairs: map[BigramKey]fakeTerm{bk("open", "source"): {df: 10, maxFreq: 3}, bk("box", "zero"): {df: 2, maxFreq: 1}}},
+		{pairs: map[BigramKey]fakeTerm{bk("open", "source"): {df: 8, maxFreq: 7}}},
+	})
+	// Box 1: one shard with "open source" only.
+	box1 := buildBigrams([]fakeBigramShard{
+		{pairs: map[BigramKey]fakeTerm{bk("open", "source"): {df: 5, maxFreq: 4}}},
+	})
+
+	// Fold each box's sidecar in as one shard: the box is a BigramSource through
+	// EachBigram, so the box-level summary is built by the same builder one level up.
+	b := NewBigramRoutingBuilder()
+	b.AddShard(0, box0)
+	b.AddShard(1, box1)
+	summary := b.Build()
+
+	// open,source: box0 df 10+8=18, box1 df 5, fleet 23.
+	if got := summary.PairDocFreq("open", "source"); got != 23 {
+		t.Fatalf("summary PairDocFreq(open,source) = %d, want 23", got)
+	}
+	if got := summary.PairDocFreq("box", "zero"); got != 2 {
+		t.Fatalf("summary PairDocFreq(box,zero) = %d, want 2", got)
+	}
+
+	// The box-unique adjacency routes to box 0 alone, the phrase-level analogue of a
+	// term living in one box.
+	if bounds, covered := summary.RoutePhrase([]string{"box", "zero"}, fakeStats{n: 150}); !covered || len(bounds) != 1 || bounds[0].Shard != 0 {
+		t.Fatalf("box,zero routed to %v (covered=%v), want box 0 only", bounds, covered)
+	}
+
+	// open,source routes to both boxes, box 0 first because its ceiling adjacency
+	// frequency (max over shards, 7) beats box 1's 4, and box 0's bound must use that
+	// ceiling scored with the fleet IDF, so it upper-bounds any phrase score in box 0.
+	bounds, covered := summary.RoutePhrase([]string{"open", "source"}, fakeStats{n: 150})
+	if !covered || len(bounds) != 2 {
+		t.Fatalf("open,source routed to %v (covered=%v), want 2 boxes", bounds, covered)
+	}
+	if bounds[0].Shard != 0 || bounds[1].Shard != 1 {
+		t.Fatalf("box order = %+v, want box 0 then 1", bounds)
+	}
+	col := Collection{N: 150}
+	sc := bm25Scorer{idf: col.IDF(23), k1: DefaultK1}
+	if want := sc.MaxScore(7); bounds[0].Bound != want {
+		t.Fatalf("box 0 bound = %v, want %v (fleet IDF times ceiling freq 7)", bounds[0].Bound, want)
+	}
+}
+
 func TestBigramRoutingRoundTrip(t *testing.T) {
 	br := buildBigrams([]fakeBigramShard{
 		{pairs: map[BigramKey]fakeTerm{
