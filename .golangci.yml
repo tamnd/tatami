@@ -1,0 +1,32 @@
+# golangci-lint v2 config. The gate stays strict; these exclusions only carve out
+# a few deliberate idioms this codebase follows, so the signal is real findings.
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # The CLI's best-effort writes to stdout and stderr are deliberately
+      # unchecked.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      # Close and closeAll on a cleanup path (defer, teardown) are deliberately
+      # unchecked throughout the tests and the mmap/file teardown.
+      - linters: [errcheck]
+        text: "`[^`]+\\.(close|Close)[a-zA-Z]*` is not checked"
+      # QF1001 (apply De Morgan's law) is a quickfix style suggestion, not a
+      # correctness finding, and the explicit form reads clearer in these tests.
+      - linters: [staticcheck]
+        text: "QF1001"
+      # S1016 would fold this struct literal into a type conversion; the explicit
+      # field mapping is intentional so the wire shape stays visible at the call.
+      - linters: [staticcheck]
+        text: "S1016"
+      # residentBytes is dormant accounting kept next to the lazy store's memory
+      # model for the skip-table RAM benchmark to call.
+      - linters: [unused]
+        path: search/liststore.go
+        text: "residentBytes"
