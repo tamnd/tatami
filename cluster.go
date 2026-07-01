@@ -321,10 +321,7 @@ func (c *Cluster) runQuery(terms []string, k int, stats search.GlobalStats, boun
 			defer wg.Done()
 			var batch []ClusterHit
 			var lvisited int64
-			for {
-				if atomic.LoadInt32(&stopped) == 1 || atomic.LoadInt32(&failed) == 1 {
-					break
-				}
+			for atomic.LoadInt32(&stopped) == 0 && atomic.LoadInt32(&failed) == 0 {
 				idx := int(atomic.AddInt64(&next, 1)) - 1
 				if idx >= len(bounds) {
 					break
