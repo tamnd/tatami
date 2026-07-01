@@ -363,7 +363,22 @@ func reopenSegmentCluster(segDir string) (*Cluster, int, error) {
 		}
 	}
 	cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
-	c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
+	// Prefer the off-heap routing (scale/11 lever three): if a routing.bin sits next
+	// to the segments, mmap it and skip the rebuild, so the reopen box pays the file,
+	// not the tens-of-gigabytes routing rebuild. The first reopen has no file, so it
+	// rebuilds once and writes routing.bin for every reopen after.
+	rpath := filepath.Join(segDir, "routing.bin")
+	var c *Cluster
+	if fileExists(rpath) {
+		c, err = OpenClusterWithRoutingFile(paths, rpath, ClusterOptions{CacheSize: cache})
+	} else {
+		c, err = OpenCluster(paths, ClusterOptions{CacheSize: cache})
+		if err == nil {
+			if werr := c.PersistRouting(rpath); werr != nil {
+				return nil, 0, fmt.Errorf("persist routing.bin: %w", werr)
+			}
+		}
+	}
 	if err != nil {
 		return nil, 0, err
 	}
