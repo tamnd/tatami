@@ -34,6 +34,7 @@ package tatami
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"math"
@@ -74,6 +75,30 @@ func filesPerShard() int { return envInt("TATAMI_FILES_PER_SHARD", 1) }
 // and every extra shard is fixed per-shard cost with nothing to hide it under,
 // while below it each shard's posting walk grows until a common term breaks budget.
 func targetShards() int { return envInt("TATAMI_TARGET_SHARDS", 0) }
+
+// clusterShards is the content-clustering lever (scale/12 lever two): the number of
+// topical shards to partition the corpus into by content instead of by crawl order.
+// Zero (the default) keeps the crawl-order file grouping the other levers use. When
+// set, the build fits a clustering model over a sample, then repartitions every
+// document into the shard whose topic it is nearest, size-balanced by a capacity
+// cap. The routing bound stays a true upper bound, so the routed result is identical
+// to the crawl-order one; what changes is that a topical query prunes to the handful
+// of shards that hold its topic instead of fanning out to nearly all of them. It is
+// the coarsening target: a small multiple of the serving box's cores.
+func clusterShards() int { return envInt("TATAMI_CLUSTER_SHARDS", 0) }
+
+// clusterSample caps how many documents the k-means fit sees. A sample pins the
+// topic structure of the corpus; more documents only refine the centroids, so this
+// bounds the fit cost independent of the corpus size.
+func clusterSample() int { return envInt("TATAMI_CLUSTER_SAMPLE", 50000) }
+
+// clusterDims is the feature-hash width, the number of buckets a document's term
+// set hashes into to form its topic sketch. A few hundred to a few thousand fits in
+// cache and collides rarely enough that disjoint topics land far apart.
+func clusterDims() int { return envInt("TATAMI_CLUSTER_DIMS", 1024) }
+
+// clusterIters is the k-means pass count over the sample.
+func clusterIters() int { return envInt("TATAMI_CLUSTER_ITERS", 15) }
 
 // chunkFiles groups paths into runs of up to per files, preserving order, so each
 // run becomes one shard.
@@ -248,6 +273,22 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 
 		t0 := nowMono()
 		keep := targetPairs()
+
+		// Content-clustering path (scale/12 lever two). When a cluster target is set,
+		// the corpus is repartitioned by content instead of by crawl-file grouping, so
+		// the group-per-shard worker pool below does not apply. The clustered build
+		// spills documents to per-shard files so only one builder is resident at a
+		// time, then folds the routing and phrase sidecars exactly as the crawl-order
+		// tail does.
+		if clusterShards() > 0 {
+			c, docs, cerr := buildClusteredCorpus(tb, matches, tmp, keep)
+			if cleanup && cerr != nil {
+				_ = os.RemoveAll(tmp)
+			}
+			shardedC, shardedDocs, shardedErr = c, docs, cerr
+			return
+		}
+
 		var mu sync.Mutex // guards the counters and firstErr
 		var done, built, resumed int
 		var firstErr error
@@ -357,6 +398,168 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 		tb.Fatal(shardedErr)
 	}
 	return shardedC, shardedDocs
+}
+
+// buildClusteredCorpus partitions the corpus into clusterShards() topical shards by
+// content and returns the open broker plus the document count (scale/12 lever two).
+// It runs three passes over the crawl so peak memory stays bounded whatever the
+// corpus size: pass one counts every document and samples the first clusterSample()
+// to fit the k-means model; pass two assigns each document to its nearest topical
+// shard under a capacity cap and spills it to that shard's file, holding only the
+// clusterer and one open spill writer per shard; pass three builds each shard from
+// its spill file one at a time, so only one SearchBuilder is resident. The routing
+// index and phrase sidecars fold exactly as the crawl-order build's tail does, and
+// the segments are written with the same seg-NNNNN names so a later measure-only
+// reopen cannot tell a clustered corpus from a crawl-order one.
+func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[search.BigramKey]bool) (*Cluster, int, error) {
+	k := clusterShards()
+	t0 := nowMono()
+
+	// Pass one: count every document and collect a bounded sample to fit the model.
+	// One parse of the crawl yields both the total (for the capacity cap) and the
+	// sample (for the centroids), so the fit costs no extra pass.
+	var sample [][]string
+	sampleCap := clusterSample()
+	total := 0
+	for _, f := range matches {
+		n, err := eachWETFile(f, math.MaxInt32, func(d SearchDoc) {
+			if len(sample) < sampleCap {
+				sample = append(sample, tokenize(d.Body))
+			}
+		})
+		if err != nil {
+			return nil, 0, fmt.Errorf("cluster sample pass %s: %w", filepath.Base(f), err)
+		}
+		total += n
+	}
+	cl := FitClusterer(sample, ClusterPlanOptions{
+		Shards: k, Dims: clusterDims(), Iters: clusterIters(), Seed: 1, Slack: 0.15,
+	})
+	cl.SetCapacity(total, 0.15)
+	tb.Logf("clustering: fit %d centroids over %d of %d docs, %v",
+		cl.Shards(), len(sample), total, nowMono().Sub(t0).Round(time.Second))
+
+	// Pass two: assign and spill. One gob writer per shard stays open, so a document
+	// from any crawl file streams straight into its shard's file with no buffering of
+	// the whole corpus. The spill carries the whole SearchDoc, since the shard build
+	// re-tokenizes it into the index and keeps a snippet.
+	spillPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("spill-%05d.gob", i)) }
+	files := make([]*os.File, k)
+	encs := make([]*gob.Encoder, k)
+	for i := range files {
+		f, err := os.Create(spillPath(i))
+		if err != nil {
+			return nil, 0, fmt.Errorf("create spill %d: %w", i, err)
+		}
+		files[i], encs[i] = f, gob.NewEncoder(f)
+	}
+	sizes := make([]int, k)
+	var spillErr error
+	for _, f := range matches {
+		if spillErr != nil {
+			break
+		}
+		if _, err := eachWETFile(f, math.MaxInt32, func(d SearchDoc) {
+			if spillErr != nil {
+				return
+			}
+			s := cl.Assign(tokenize(d.Body))
+			if err := encs[s].Encode(&d); err != nil {
+				spillErr = fmt.Errorf("spill encode shard %d: %w", s, err)
+				return
+			}
+			sizes[s]++
+		}); err != nil {
+			spillErr = fmt.Errorf("cluster assign pass %s: %w", filepath.Base(f), err)
+		}
+	}
+	for i := range files {
+		if cerr := files[i].Close(); cerr != nil && spillErr == nil {
+			spillErr = cerr
+		}
+	}
+	if spillErr != nil {
+		return nil, 0, spillErr
+	}
+	tb.Logf("clustering: spilled %d docs into %d shards, sizes min %d max %d, %v",
+		total, k, minInt(sizes), maxInt(sizes), nowMono().Sub(t0).Round(time.Second))
+
+	// Pass three: build each non-empty shard from its spill, one resident builder at
+	// a time, writing the segment and its bigram sidecar under seg-NNNNN names. The
+	// spill is removed as soon as its shard is written, so the disk high-water mark is
+	// the corpus once, not twice.
+	segPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("seg-%05d.tatami", i)) }
+	bgrPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("seg-%05d.bgr", i)) }
+	var paths []string
+	for i := range sizes {
+		if sizes[i] == 0 {
+			_ = os.Remove(spillPath(i))
+			continue
+		}
+		b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true})
+		f, err := os.Open(spillPath(i))
+		if err != nil {
+			return nil, 0, fmt.Errorf("open spill %d: %w", i, err)
+		}
+		dec := gob.NewDecoder(f)
+		for {
+			var d SearchDoc
+			if derr := dec.Decode(&d); derr != nil {
+				if derr == io.EOF {
+					break
+				}
+				f.Close()
+				return nil, 0, fmt.Errorf("spill decode shard %d: %w", i, derr)
+			}
+			b.Add(d)
+		}
+		f.Close()
+		if err := writeSegmentAtomic(b, segPath(i)); err != nil {
+			return nil, 0, fmt.Errorf("write clustered segment %d: %w", i, err)
+		}
+		if err := writeBigramSidecar(bgrPath(i), keptBigrams{src: b, keep: keep}); err != nil {
+			return nil, 0, fmt.Errorf("write clustered sidecar %d: %w", i, err)
+		}
+		_ = os.Remove(spillPath(i))
+		paths = append(paths, segPath(i))
+	}
+
+	// Shared tail: build the routing index over the clustered shards and fold their
+	// phrase sidecars, the same broker the crawl-order build returns.
+	cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
+	c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
+	if err != nil {
+		return nil, 0, err
+	}
+	bb := search.NewBigramRoutingBuilder()
+	for i, p := range paths {
+		src, err := readBigramSidecar(strings.TrimSuffix(p, ".tatami") + ".bgr")
+		if err != nil {
+			return nil, 0, fmt.Errorf("read clustered sidecar %d: %w", i, err)
+		}
+		bb.AddShard(uint32(i), src)
+	}
+	tb.Logf("clustered cluster ready: %d shards, %d docs, %d terms in routing, %v",
+		c.NumShards(), c.NumDocs(), c.Routing().NumTerms(), nowMono().Sub(t0).Round(time.Second))
+	return c.WithBigramRouting(bb.Build()), c.NumDocs(), nil
+}
+
+// minInt and maxInt report the extremes of a slice, for logging the clustered shard
+// balance.
+func minInt(s []int) int {
+	m := s[0]
+	for _, v := range s {
+		m = min(m, v)
+	}
+	return m
+}
+
+func maxInt(s []int) int {
+	m := s[0]
+	for _, v := range s {
+		m = max(m, v)
+	}
+	return m
 }
 
 // reopenSegmentCluster builds a broker from the segments already in segDir, with no
