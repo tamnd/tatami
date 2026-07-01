@@ -161,8 +161,8 @@ func TestRoutingEncodeRoundtrip(t *testing.T) {
 	if !reflect.DeepEqual(back.shardDocs, ri.shardDocs) {
 		t.Fatalf("shardDocs differ: %v vs %v", back.shardDocs, ri.shardDocs)
 	}
-	if !reflect.DeepEqual(back.terms, ri.terms) {
-		t.Fatalf("term routes differ after roundtrip")
+	if !reflect.DeepEqual(back, ri) {
+		t.Fatalf("flat routing differs after roundtrip")
 	}
 
 	// Re-encoding the decoded index must reproduce the same bytes (deterministic).

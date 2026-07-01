@@ -21,6 +21,17 @@ package search
 // frequency per term per shard), never posting payloads, so it is far smaller
 // than the shards it routes and is meant to live resident in the broker's memory
 // or be loaded from a persisted sidecar.
+//
+// The resident form is flat and pointer-free (07-routing-latency.md, the off-heap
+// routing note). A map[string]*termRoute over tens of millions of terms is tens of
+// gigabytes of pointer-rich memory the garbage collector must trace every cycle,
+// which at 10M documents turned a serving box into either second-long GC pauses or
+// an out-of-memory kill. The index instead holds its terms as one sorted byte blob
+// with an offset table, and its per-shard postings as parallel column arrays in
+// compressed-sparse-row form: a term id indexes a slice of the postShard, postDf,
+// and postMax columns. The collector sees a handful of slice headers and traces
+// nothing inside them, so a routing index of any size costs the GC almost nothing,
+// and the same flat columns memory-map directly for an off-heap load.
 
 import (
 	"encoding/binary"
@@ -28,8 +39,10 @@ import (
 	"sort"
 )
 
-// shardPosting is one shard's entry for a term: the shard id, the term's document
-// frequency in that shard, and its maximum in-document frequency there.
+// shardPosting is one shard's entry for a term during a build: the shard id, the
+// term's document frequency in that shard, and its maximum in-document frequency
+// there. It lives only in the builder's accumulator; the sealed index holds the
+// same facts as flat columns.
 type shardPosting struct {
 	shard   uint32
 	df      uint32
@@ -37,7 +50,7 @@ type shardPosting struct {
 }
 
 // termRoute is a term's global document frequency and the per-shard postings that
-// sum to it, kept ascending by shard id.
+// sum to it during a build, kept ascending by shard id.
 type termRoute struct {
 	globalDF uint64
 	shards   []shardPosting
@@ -47,8 +60,21 @@ type termRoute struct {
 // live-document counts and the collection total. It satisfies GlobalStats, so it
 // is both the structure that picks which shards to visit and the source of the
 // global IDF those shards are scored with.
+//
+// It is stored flat and pointer-free. termBlob holds every term's bytes in
+// ascending order, termOff its per-term start offsets (len numTerms+1, so term i
+// is termBlob[termOff[i]:termOff[i+1]]). globalDF is the per-term collection
+// frequency. postOff (len numTerms+1) slices the posting columns: term i's
+// postings are postShard/postDf/postMax over [postOff[i]:postOff[i+1]], ascending
+// by shard id. A term id is the index a binary search over termBlob resolves.
 type RoutingIndex struct {
-	terms     map[string]*termRoute
+	termBlob  []byte
+	termOff   []uint32
+	globalDF  []uint64
+	postOff   []uint64
+	postShard []uint32
+	postDf    []uint32
+	postMax   []uint32
 	shardDocs []int // live documents per shard, indexed by shard id
 	totalDocs int
 }
@@ -65,7 +91,9 @@ type ShardBound struct {
 // AddShard call the next shard id, so a builder over a directory of files holds
 // only one shard's dictionary in flight rather than all of them. The shard ids it
 // assigns match the order shards are added, which a broker relies on to map a
-// routed shard id back to its file path.
+// routed shard id back to its file path. It accumulates into a map and compacts to
+// the flat form in Build; the map is the transient build cost, not the resident
+// serving cost.
 type RoutingBuilder struct {
 	terms     map[string]*termRoute
 	shardDocs []int
@@ -106,9 +134,53 @@ func (b *RoutingBuilder) AddShard(src RoutingSource) uint32 {
 	return sid
 }
 
-// Build seals the accumulated shards into a routing index.
+// Build seals the accumulated shards into a flat routing index and releases the
+// builder's map so the collector can reclaim it, leaving only the pointer-free
+// columns resident.
 func (b *RoutingBuilder) Build() *RoutingIndex {
-	return &RoutingIndex{terms: b.terms, shardDocs: b.shardDocs, totalDocs: b.totalDocs}
+	keys := make([]string, 0, len(b.terms))
+	var totalPost, totalBytes int
+	for t, tr := range b.terms {
+		keys = append(keys, t)
+		totalPost += len(tr.shards)
+		totalBytes += len(t)
+	}
+	sort.Strings(keys)
+
+	ri := &RoutingIndex{
+		termBlob:  make([]byte, 0, totalBytes),
+		termOff:   make([]uint32, len(keys)+1),
+		globalDF:  make([]uint64, len(keys)),
+		postOff:   make([]uint64, len(keys)+1),
+		postShard: make([]uint32, totalPost),
+		postDf:    make([]uint32, totalPost),
+		postMax:   make([]uint32, totalPost),
+		shardDocs: b.shardDocs,
+		totalDocs: b.totalDocs,
+	}
+	var po uint64
+	for i, t := range keys {
+		tr := b.terms[t]
+		ri.termOff[i] = uint32(len(ri.termBlob))
+		ri.termBlob = append(ri.termBlob, t...)
+		ri.globalDF[i] = tr.globalDF
+		ri.postOff[i] = po
+		for _, sp := range tr.shards {
+			ri.postShard[po] = sp.shard
+			ri.postDf[po] = sp.df
+			ri.postMax[po] = sp.maxFreq
+			po++
+		}
+		// Release this term's postings backing array as we copy it out, so the map's
+		// payload shrinks while the flat columns grow instead of both being resident
+		// at once. At tens of millions of terms that halves the compaction's peak, the
+		// difference between fitting the build in memory and not.
+		delete(b.terms, t)
+	}
+	ri.termOff[len(keys)] = uint32(len(ri.termBlob))
+	ri.postOff[len(keys)] = po
+	b.terms = nil
+	return ri
 }
 
 // BuildRouting builds a routing index over a fixed set of shards, assigning shard
@@ -122,6 +194,56 @@ func BuildRouting(shards []RoutingSource) *RoutingIndex {
 	return b.Build()
 }
 
+// numTerms is the distinct term count, the number of entries in the flat columns.
+func (ri *RoutingIndex) numTerms() int {
+	if len(ri.termOff) == 0 {
+		return 0
+	}
+	return len(ri.termOff) - 1
+}
+
+// termAt returns term i's bytes as a sub-slice of the blob, no allocation.
+func (ri *RoutingIndex) termAt(i int) []byte {
+	return ri.termBlob[ri.termOff[i]:ri.termOff[i+1]]
+}
+
+// lookup resolves a term to its id by binary search over the sorted blob, or
+// reports absence. It compares the stored bytes against the query string without
+// allocating a string per probe.
+func (ri *RoutingIndex) lookup(term string) (int, bool) {
+	n := ri.numTerms()
+	i := sort.Search(n, func(i int) bool { return cmpBytesStr(ri.termAt(i), term) >= 0 })
+	if i < n && cmpBytesStr(ri.termAt(i), term) == 0 {
+		return i, true
+	}
+	return -1, false
+}
+
+// cmpBytesStr compares a byte slice to a string the way bytes.Compare would, with
+// no allocation, returning -1, 0, or 1.
+func cmpBytesStr(b []byte, s string) int {
+	n := len(b)
+	if len(s) < n {
+		n = len(s)
+	}
+	for i := 0; i < n; i++ {
+		if b[i] != s[i] {
+			if b[i] < s[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case len(b) < len(s):
+		return -1
+	case len(b) > len(s):
+		return 1
+	default:
+		return 0
+	}
+}
+
 // NumDocs is N, the live document count across the whole collection.
 func (ri *RoutingIndex) NumDocs() int { return ri.totalDocs }
 
@@ -129,13 +251,13 @@ func (ri *RoutingIndex) NumDocs() int { return ri.totalDocs }
 func (ri *RoutingIndex) NumShards() int { return len(ri.shardDocs) }
 
 // NumTerms is the distinct term count across the collection.
-func (ri *RoutingIndex) NumTerms() int { return len(ri.terms) }
+func (ri *RoutingIndex) NumTerms() int { return ri.numTerms() }
 
 // DocFreq is a term's document frequency summed across every shard, or zero when
 // no shard holds it.
 func (ri *RoutingIndex) DocFreq(term string) int {
-	if tr, ok := ri.terms[term]; ok {
-		return int(tr.globalDF)
+	if i, ok := ri.lookup(term); ok {
+		return int(ri.globalDF[i])
 	}
 	return 0
 }
@@ -151,12 +273,14 @@ func (ri *RoutingIndex) ShardDocs(shard int) int {
 
 // EachPosting calls fn for every (term, shard) posting in the index, with the
 // term's document frequency and maximum in-document frequency in that shard. It is
-// for measurement and for re-serializing into a different layout; the order is the
-// index's internal map order and is not stable.
+// for measurement and for re-serializing into a different layout; the order is
+// ascending by term then by shard id.
 func (ri *RoutingIndex) EachPosting(fn func(term string, shard, df, maxFreq uint32)) {
-	for term, tr := range ri.terms {
-		for _, sp := range tr.shards {
-			fn(term, sp.shard, sp.df, sp.maxFreq)
+	n := ri.numTerms()
+	for i := 0; i < n; i++ {
+		term := string(ri.termAt(i))
+		for j := ri.postOff[i]; j < ri.postOff[i+1]; j++ {
+			fn(term, ri.postShard[j], ri.postDf[j], ri.postMax[j])
 		}
 	}
 }
@@ -186,13 +310,13 @@ func (ri *RoutingIndex) RouteWith(terms []string, stats GlobalStats) []ShardBoun
 	col := Collection{N: stats.NumDocs()}
 	bounds := make(map[uint32]Score)
 	for _, t := range terms {
-		tr := ri.terms[t]
-		if tr == nil {
+		i, ok := ri.lookup(t)
+		if !ok {
 			continue
 		}
 		sc := bm25Scorer{idf: col.IDF(stats.DocFreq(t)), k1: DefaultK1}
-		for _, sp := range tr.shards {
-			bounds[sp.shard] += sc.MaxScore(sp.maxFreq)
+		for j := ri.postOff[i]; j < ri.postOff[i+1]; j++ {
+			bounds[ri.postShard[j]] += sc.MaxScore(ri.postMax[j])
 		}
 	}
 	out := make([]ShardBound, 0, len(bounds))
@@ -212,36 +336,34 @@ func (ri *RoutingIndex) RouteWith(terms []string, stats GlobalStats) []ShardBoun
 // so a broker can persist it as a sidecar and reload it without re-scanning every
 // shard's dictionary. The layout is uvarint-framed throughout: the collection
 // total, the per-shard live counts, then each term with its global frequency and
-// its ascending per-shard postings.
+// its ascending per-shard postings, terms in ascending order.
 func EncodeRouting(ri *RoutingIndex) []byte {
 	out := binary.AppendUvarint(nil, uint64(ri.totalDocs))
 	out = binary.AppendUvarint(out, uint64(len(ri.shardDocs)))
 	for _, d := range ri.shardDocs {
 		out = binary.AppendUvarint(out, uint64(d))
 	}
-	// Terms in sorted order so the encoding is deterministic.
-	keys := make([]string, 0, len(ri.terms))
-	for t := range ri.terms {
-		keys = append(keys, t)
-	}
-	sort.Strings(keys)
-	out = binary.AppendUvarint(out, uint64(len(keys)))
-	for _, t := range keys {
-		tr := ri.terms[t]
+	n := ri.numTerms()
+	out = binary.AppendUvarint(out, uint64(n))
+	for i := 0; i < n; i++ {
+		t := ri.termAt(i)
 		out = binary.AppendUvarint(out, uint64(len(t)))
 		out = append(out, t...)
-		out = binary.AppendUvarint(out, tr.globalDF)
-		out = binary.AppendUvarint(out, uint64(len(tr.shards)))
-		for _, sp := range tr.shards {
-			out = binary.AppendUvarint(out, uint64(sp.shard))
-			out = binary.AppendUvarint(out, uint64(sp.df))
-			out = binary.AppendUvarint(out, uint64(sp.maxFreq))
+		out = binary.AppendUvarint(out, ri.globalDF[i])
+		s, e := ri.postOff[i], ri.postOff[i+1]
+		out = binary.AppendUvarint(out, e-s)
+		for j := s; j < e; j++ {
+			out = binary.AppendUvarint(out, uint64(ri.postShard[j]))
+			out = binary.AppendUvarint(out, uint64(ri.postDf[j]))
+			out = binary.AppendUvarint(out, uint64(ri.postMax[j]))
 		}
 	}
 	return out
 }
 
-// DecodeRouting reconstructs a routing index from the bytes EncodeRouting wrote.
+// DecodeRouting reconstructs a flat routing index from the bytes EncodeRouting
+// wrote. The terms are already in ascending order on the wire, so it fills the
+// flat columns in one pass without sorting.
 func DecodeRouting(b []byte) (*RoutingIndex, error) {
 	r := &byteReader{b: b}
 	total := int(r.uvarint())
@@ -251,24 +373,34 @@ func DecodeRouting(b []byte) (*RoutingIndex, error) {
 		shardDocs[i] = int(r.uvarint())
 	}
 	nTerms := int(r.uvarint())
-	terms := make(map[string]*termRoute, nTerms)
+	ri := &RoutingIndex{
+		termOff:   make([]uint32, nTerms+1),
+		globalDF:  make([]uint64, nTerms),
+		postOff:   make([]uint64, nTerms+1),
+		shardDocs: shardDocs,
+		totalDocs: total,
+	}
+	var po uint64
 	for i := 0; i < nTerms; i++ {
 		tl := int(r.uvarint())
-		term := string(r.take(tl))
-		tr := &termRoute{globalDF: r.uvarint()}
+		ri.termOff[i] = uint32(len(ri.termBlob))
+		ri.termBlob = append(ri.termBlob, r.take(tl)...)
+		ri.globalDF[i] = r.uvarint()
+		ri.postOff[i] = po
 		ns := int(r.uvarint())
-		tr.shards = make([]shardPosting, ns)
 		for j := 0; j < ns; j++ {
-			tr.shards[j] = shardPosting{
-				shard:   uint32(r.uvarint()),
-				df:      uint32(r.uvarint()),
-				maxFreq: uint32(r.uvarint()),
-			}
+			ri.postShard = append(ri.postShard, uint32(r.uvarint()))
+			ri.postDf = append(ri.postDf, uint32(r.uvarint()))
+			ri.postMax = append(ri.postMax, uint32(r.uvarint()))
+			po++
 		}
-		terms[term] = tr
+	}
+	if nTerms >= 0 {
+		ri.termOff[nTerms] = uint32(len(ri.termBlob))
+		ri.postOff[nTerms] = po
 	}
 	if r.err != nil {
 		return nil, fmt.Errorf("search: decode routing index: %w", r.err)
 	}
-	return &RoutingIndex{terms: terms, shardDocs: shardDocs, totalDocs: total}, nil
+	return ri, nil
 }

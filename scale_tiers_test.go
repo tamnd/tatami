@@ -38,48 +38,51 @@ func wetDir() string {
 	return filepath.Join(home, "data", "ccrawl", "wet-parquet")
 }
 
-// readWET reads up to limit documents across the directory's Parquet shards, in
-// filename order, mapping the WET columns onto SearchDoc. It stops as soon as it
-// has limit docs so a tier costs only the files it needs.
-func readWET(dir string, limit int) ([]SearchDoc, error) {
+// eachWET streams up to limit documents across the directory's Parquet shards, in
+// filename order, mapping the WET columns onto SearchDoc and handing each to fn.
+// It never accumulates the documents, so the 10M tier (whose raw text is tens of
+// gigabytes, more than this box's RAM) flows straight into the streaming builder
+// instead of materializing a giant slice. It stops as soon as it has fed limit
+// docs so a tier costs only the files it needs.
+func eachWET(dir string, limit int, fn func(SearchDoc)) (int, error) {
 	matches, err := filepath.Glob(filepath.Join(dir, "*.parquet"))
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	sort.Strings(matches)
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("no parquet shards in %s", dir)
+		return 0, fmt.Errorf("no parquet shards in %s", dir)
 	}
-	docs := make([]SearchDoc, 0, limit)
+	seen := 0
 	for _, path := range matches {
-		if len(docs) >= limit {
+		if seen >= limit {
 			break
 		}
-		got, err := readWETFile(path, limit-len(docs))
+		got, err := eachWETFile(path, limit-seen, fn)
 		if err != nil {
-			return nil, err
+			return seen, err
 		}
-		docs = append(docs, got...)
+		seen += got
 	}
-	if len(docs) < limit {
-		return nil, fmt.Errorf("only %d docs available in %s, need %d", len(docs), dir, limit)
+	if seen < limit {
+		return seen, fmt.Errorf("only %d docs available in %s, need %d", seen, dir, limit)
 	}
-	return docs, nil
+	return seen, nil
 }
 
-func readWETFile(path string, limit int) ([]SearchDoc, error) {
+func eachWETFile(path string, limit int, fn func(SearchDoc)) (int, error) {
 	in, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer func() { _ = in.Close() }()
 	info, err := in.Stat()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	pf, err := parquet.OpenFile(in, info.Size())
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	idx := map[string]int{}
 	for i, f := range pf.Schema().Fields() {
@@ -90,36 +93,33 @@ func readWETFile(path string, limit int) ([]SearchDoc, error) {
 	reader := parquet.NewGenericReader[any](pf)
 	defer func() { _ = reader.Close() }()
 	rows := make([]parquet.Row, 4096)
-	docs := make([]SearchDoc, 0, limit)
-	for len(docs) < limit {
+	fed := 0
+	for fed < limit {
 		n, rerr := reader.ReadRows(rows)
-		for i := 0; i < n && len(docs) < limit; i++ {
+		for i := 0; i < n && fed < limit; i++ {
 			row := rows[i]
-			docs = append(docs, SearchDoc{
+			fn(SearchDoc{
 				DocID: row[idCol].String(),
 				URL:   row[urlCol].String(),
 				Title: row[urlCol].String(),
 				Body:  row[textCol].String(),
 			})
+			fed++
 		}
 		if rerr == io.EOF {
 			break
 		}
 		if rerr != nil {
-			return nil, rerr
+			return fed, rerr
 		}
 	}
-	return docs, nil
+	return fed, nil
 }
 
 // buildTierSegment reads limit real docs, builds a segment, and returns the open
 // handle plus the build time and on-disk size. The caller closes the handle.
 func buildTierSegment(tb testing.TB, limit int) (seg *SearchSegment, build time.Duration, onDisk int64, open time.Duration) {
 	dir := wetDir()
-	docs, err := readWET(dir, limit)
-	if err != nil {
-		tb.Skipf("WET corpus unavailable (%v); set TATAMI_WET_DIR to run", err)
-	}
 
 	tmp, err := os.MkdirTemp("", "tatami-tier-")
 	if err != nil {
@@ -144,8 +144,8 @@ func buildTierSegment(tb testing.TB, limit int) (seg *SearchSegment, build time.
 	if err != nil {
 		tb.Fatal(err)
 	}
-	for _, d := range docs {
-		sb.Add(d)
+	if _, err := eachWET(dir, limit, func(d SearchDoc) { sb.Add(d) }); err != nil {
+		tb.Skipf("WET corpus unavailable (%v); set TATAMI_WET_DIR to run", err)
 	}
 	if err := sb.Close(); err != nil {
 		tb.Fatal(err)
@@ -182,6 +182,7 @@ func TestScaleTier(t *testing.T) {
 		{"10k", 10_000},
 		{"100k", 100_000},
 		{"1M", 1_000_000},
+		{"10M", 10_000_000},
 	} {
 		t.Run(tier.name, func(t *testing.T) {
 			seg, build, onDisk, open := buildTierSegment(t, tier.docs)
