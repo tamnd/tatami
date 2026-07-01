@@ -400,6 +400,37 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 	return shardedC, shardedDocs
 }
 
+// parseFilesParallel runs fn over every file index across a bounded worker pool and
+// returns the first error. Pass one's files are independent (count and sample), so the
+// pool needs no ordering: the caller merges the per-file results in index order after.
+func parseFilesParallel(matches []string, workers int, fn func(fi int, f string) error) error {
+	jobs := make(chan int)
+	var mu sync.Mutex
+	var firstErr error
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for fi := range jobs {
+				if err := fn(fi, matches[fi]); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for fi := range matches {
+		jobs <- fi
+	}
+	close(jobs)
+	wg.Wait()
+	return firstErr
+}
+
 // buildClusteredCorpus partitions the corpus into clusterShards() topical shards by
 // content and returns the open broker plus the document count (scale/12 lever two).
 // It runs three passes over the crawl so peak memory stays bounded whatever the
@@ -416,21 +447,41 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 	t0 := nowMono()
 
 	// Pass one: count every document and collect a bounded sample to fit the model.
-	// One parse of the crawl yields both the total (for the capacity cap) and the
-	// sample (for the centroids), so the fit costs no extra pass.
-	var sample [][]string
+	// Files parse in parallel across the build workers, each contributing its own count
+	// and a bounded per-file slice of the sample, merged in file order afterward so the
+	// total and the sample are the same whatever order the workers finish in (the
+	// per-file quota also spreads the sample across the corpus instead of drawing it all
+	// from the first file). One parse yields both, so the fit costs no extra pass.
+	workers := buildWorkers()
 	sampleCap := clusterSample()
-	total := 0
-	for _, f := range matches {
+	perFileSample := (sampleCap + len(matches) - 1) / max(len(matches), 1)
+	counts := make([]int, len(matches))
+	samples := make([][][]string, len(matches))
+	if err := parseFilesParallel(matches, workers, func(fi int, f string) error {
 		n, err := eachWETFile(f, math.MaxInt32, func(d SearchDoc) {
-			if len(sample) < sampleCap {
-				sample = append(sample, tokenize(d.Body))
+			if len(samples[fi]) < perFileSample {
+				samples[fi] = append(samples[fi], tokenize(d.Body))
 			}
 		})
 		if err != nil {
-			return nil, 0, fmt.Errorf("cluster sample pass %s: %w", filepath.Base(f), err)
+			return fmt.Errorf("cluster sample pass %s: %w", filepath.Base(f), err)
 		}
-		total += n
+		counts[fi] = n
+		return nil
+	}); err != nil {
+		return nil, 0, err
+	}
+	total := 0
+	var sample [][]string
+	for fi := range matches {
+		total += counts[fi]
+		if room := sampleCap - len(sample); room > 0 {
+			s := samples[fi]
+			if len(s) > room {
+				s = s[:room]
+			}
+			sample = append(sample, s...)
+		}
 	}
 	cl := FitClusterer(sample, ClusterPlanOptions{
 		Shards: k, Dims: clusterDims(), Iters: clusterIters(), Seed: 1, Slack: 0.15,
@@ -455,22 +506,54 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 	}
 	sizes := make([]int, k)
 	var spillErr error
-	for _, f := range matches {
-		if spillErr != nil {
-			break
+	// Parse a window of files in parallel and compute each document's topic vector on
+	// the worker (the vector hashing is the per-document cost), then assign and spill in
+	// crawl order on this goroutine. The assignment mutates the capacity fill counts, so
+	// it stays single-threaded, but it is only a dot over k centroids per document, cheap
+	// next to the parse it now overlaps. Ordering the windowed results by file keeps the
+	// capacity-spill assignment deterministic: the same corpus yields the same shards.
+	type docVec struct {
+		doc SearchDoc
+		vec []float32
+	}
+	for base := 0; base < len(matches) && spillErr == nil; base += workers {
+		hi := min(base+workers, len(matches))
+		window := matches[base:hi]
+		parsed := make([][]docVec, len(window))
+		perr := make([]error, len(window))
+		var wg sync.WaitGroup
+		for j := range window {
+			wg.Add(1)
+			go func(j int) {
+				defer wg.Done()
+				var out []docVec
+				if _, err := eachWETFile(window[j], math.MaxInt32, func(d SearchDoc) {
+					out = append(out, docVec{doc: d, vec: cl.Vector(tokenize(d.Body))})
+				}); err != nil {
+					perr[j] = err
+					return
+				}
+				parsed[j] = out
+			}(j)
 		}
-		if _, err := eachWETFile(f, math.MaxInt32, func(d SearchDoc) {
+		wg.Wait()
+		for j := range window {
+			if perr[j] != nil {
+				spillErr = fmt.Errorf("cluster assign pass %s: %w", filepath.Base(window[j]), perr[j])
+				break
+			}
+			for _, dv := range parsed[j] {
+				s := cl.AssignVec(dv.vec)
+				d := dv.doc
+				if err := encs[s].Encode(&d); err != nil {
+					spillErr = fmt.Errorf("spill encode shard %d: %w", s, err)
+					break
+				}
+				sizes[s]++
+			}
 			if spillErr != nil {
-				return
+				break
 			}
-			s := cl.Assign(tokenize(d.Body))
-			if err := encs[s].Encode(&d); err != nil {
-				spillErr = fmt.Errorf("spill encode shard %d: %w", s, err)
-				return
-			}
-			sizes[s]++
-		}); err != nil {
-			spillErr = fmt.Errorf("cluster assign pass %s: %w", filepath.Base(f), err)
 		}
 	}
 	for i := range files {
@@ -484,22 +567,26 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 	tb.Logf("clustering: spilled %d docs into %d shards, sizes min %d max %d, %v",
 		total, k, minInt(sizes), maxInt(sizes), nowMono().Sub(t0).Round(time.Second))
 
-	// Pass three: build each non-empty shard from its spill, one resident builder at
-	// a time, writing the segment and its bigram sidecar under seg-NNNNN names. The
-	// spill is removed as soon as its shard is written, so the disk high-water mark is
-	// the corpus once, not twice.
+	// Pass three: build each non-empty shard from its spill, writing the segment and
+	// its bigram sidecar under seg-NNNNN names, then removing the spill so the disk
+	// high-water mark is the corpus once, not twice. The shards are independent, so the
+	// build fans out across the workers exactly as the crawl-order build does: peak
+	// memory is the worker count of resident builders, not the whole corpus.
 	segPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("seg-%05d.tatami", i)) }
 	bgrPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("seg-%05d.bgr", i)) }
-	var paths []string
+	var todo []int
 	for i := range sizes {
 		if sizes[i] == 0 {
 			_ = os.Remove(spillPath(i))
 			continue
 		}
+		todo = append(todo, i)
+	}
+	buildOne := func(i int) error {
 		b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true})
 		f, err := os.Open(spillPath(i))
 		if err != nil {
-			return nil, 0, fmt.Errorf("open spill %d: %w", i, err)
+			return fmt.Errorf("open spill %d: %w", i, err)
 		}
 		dec := gob.NewDecoder(f)
 		for {
@@ -509,18 +596,51 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 					break
 				}
 				f.Close()
-				return nil, 0, fmt.Errorf("spill decode shard %d: %w", i, derr)
+				return fmt.Errorf("spill decode shard %d: %w", i, derr)
 			}
 			b.Add(d)
 		}
 		f.Close()
 		if err := writeSegmentAtomic(b, segPath(i)); err != nil {
-			return nil, 0, fmt.Errorf("write clustered segment %d: %w", i, err)
+			return fmt.Errorf("write clustered segment %d: %w", i, err)
 		}
 		if err := writeBigramSidecar(bgrPath(i), keptBigrams{src: b, keep: keep}); err != nil {
-			return nil, 0, fmt.Errorf("write clustered sidecar %d: %w", i, err)
+			return fmt.Errorf("write clustered sidecar %d: %w", i, err)
 		}
 		_ = os.Remove(spillPath(i))
+		return nil
+	}
+	jobs := make(chan int)
+	var bmu sync.Mutex
+	var buildErr error
+	var bwg sync.WaitGroup
+	for range workers {
+		bwg.Add(1)
+		go func() {
+			defer bwg.Done()
+			for i := range jobs {
+				if err := buildOne(i); err != nil {
+					bmu.Lock()
+					if buildErr == nil {
+						buildErr = err
+					}
+					bmu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, i := range todo {
+		jobs <- i
+	}
+	close(jobs)
+	bwg.Wait()
+	if buildErr != nil {
+		return nil, 0, buildErr
+	}
+	// Assemble the segment paths in shard-index order, the order a measure-only reopen
+	// sees them (it globs and sorts seg-*.tatami), so the two agree on shard ids.
+	paths := make([]string, 0, len(todo))
+	for _, i := range todo {
 		paths = append(paths, segPath(i))
 	}
 
