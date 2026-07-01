@@ -4,26 +4,41 @@ package tatami
 // working set of open. The whole crawl is far larger than that: a hundred thousand
 // shards is hundreds of leaves' worth, and no one process holds the routing for
 // all of them or opens their files. An Aggregator is the next tier up, the tree of
-// brokers the M8 note described and did not build: it fans a query out to many
-// leaf Clusters at once, has each leaf route and prune over its own shards, and
-// merges the leaves' partial results into one fleet-wide top-k
-// (13-search-only-and-scale.md).
+// brokers the M8 note described: it routes a query to the leaf Clusters that can
+// contribute, fans out to those, has each leaf route and prune over its own shards,
+// and merges the leaves' partial results into one fleet-wide top-k (scale/11 lever
+// four).
 //
-// Two things make the merge exact rather than a best-effort blend. First, every
-// leaf scores against the same fleet-wide statistics: an Aggregator sums the
-// per-leaf document counts and per-term document frequencies into one GlobalStats
-// and passes it down, so a term's IDF is identical on every leaf and the partial
-// top-k lists are on one scale. Second, each leaf's routing bound is computed from
-// those same fleet-wide statistics, so a leaf's early stop stays a true upper
-// bound at fleet scale and prunes without dropping a result. The merged top-k is
-// therefore byte-identical to a single broker over every shard, which a test
-// checks directly.
+// The whole tier reuses the machinery a Cluster already is, because a leaf
+// summarizes as a shard. A search.RoutingIndex satisfies search.RoutingSource
+// (LiveDocs and EachTerm), so folding each leaf's own routing index into one more
+// RoutingBuilder yields a routing index whose shards are leaves: its per-(term,
+// leaf) posting carries the leaf's fleet-frequency contribution and the ceiling
+// frequency any document in the leaf can reach. That one structure, the box-level
+// summary, is two things at once. It is what the aggregator routes on, one entry per
+// (term, leaf) rather than per (term, shard), so a fleet of leaves is a small
+// summary. And it is the fleet-wide GlobalStats every leaf is scored with, because
+// its NumDocs is the fleet total and its DocFreq sums a term's frequency across
+// every leaf, so a term's IDF is identical on every leaf and the partial top-k lists
+// are on one scale.
 //
-// The fan-out is concurrent: each leaf Cluster serializes its own queries behind
-// its own mutex, but different leaves are independent objects, so a fleet of L
-// leaves answers in the time of the slowest single leaf plus a small merge, not
-// the sum. That is the property that keeps the latency budget flat as the shard
-// count grows: more shards means more leaves, and leaves run in parallel.
+// Two things make the merge exact rather than a best-effort blend. First, every leaf
+// scores against that one fleet-wide GlobalStats, so the partial lists are
+// comparable. Second, a leaf the summary does not route to holds no query term, so
+// it can contribute no document to the top-k, and skipping it changes nothing; a
+// leaf the summary does route to is scored in full against fleet statistics, so its
+// own early stop stays a true upper bound at fleet scale. The merged top-k is
+// therefore byte-identical to a single broker over every shard, which a test checks
+// directly.
+//
+// The fan-out is concurrent: each leaf Cluster serializes its own queries behind its
+// own mutex, but different leaves are independent objects, so a fleet of L leaves
+// answers in the time of the slowest routed leaf plus a small merge, not the sum.
+// That is the property that keeps the latency budget flat as the shard count grows:
+// more shards means more leaves, and the routed leaves run in parallel. Routing on
+// the summary is what keeps the fan-out to the leaves that can answer rather than
+// every leaf that exists, which is the cross-box analogue of a Cluster routing to
+// its shards.
 
 import (
 	"sort"
@@ -32,55 +47,37 @@ import (
 	"github.com/tamnd/tatami/search"
 )
 
-// Aggregator fans a query out to a set of leaf Clusters and merges their results
-// into a fleet-wide top-k. It holds the fleet statistics every leaf is scored
-// against. It is safe for concurrent queries to the extent its leaves are: each
-// leaf serializes internally, and a query touches each leaf once.
+// Aggregator routes a query to the leaf Clusters that can contribute, fans out to
+// them, and merges their results into a fleet-wide top-k. It holds the box-level
+// routing summary, which doubles as the fleet statistics every leaf is scored
+// against. It is safe for concurrent queries to the extent its leaves are: each leaf
+// serializes internally, and a query touches each routed leaf once.
 type Aggregator struct {
-	leaves []*Cluster
-	stats  *fleetStats
+	leaves  []*Cluster
+	summary *search.RoutingIndex // routing index whose shards are leaves; also the fleet GlobalStats
 }
 
-// fleetStats sums the corpus statistics across every leaf's routing index, so a
-// query scores against the whole fleet's document count and per-term document
-// frequency rather than any one leaf's. It satisfies search.GlobalStats.
-type fleetStats struct {
-	leaves []*search.RoutingIndex
-	n      int
-}
-
-func newFleetStats(leaves []*Cluster) *fleetStats {
-	fs := &fleetStats{}
-	for _, l := range leaves {
-		ri := l.Routing()
-		fs.leaves = append(fs.leaves, ri)
-		fs.n += ri.NumDocs()
-	}
-	return fs
-}
-
-// NumDocs is the fleet-wide live document count, summed across leaves.
-func (f *fleetStats) NumDocs() int { return f.n }
-
-// DocFreq is a term's document frequency summed across every leaf.
-func (f *fleetStats) DocFreq(term string) int {
-	df := 0
-	for _, ri := range f.leaves {
-		df += ri.DocFreq(term)
-	}
-	return df
-}
-
-// OpenAggregator returns an aggregator over the given leaf clusters, precomputing
-// the fleet statistics. The leaves keep their own routing and open-segment caches;
-// the aggregator adds only the fan-out and the merge.
+// OpenAggregator returns an aggregator over the given leaf clusters, building the
+// box-level summary by folding each leaf's routing index in as one shard. The leaf's
+// id in the summary is its index in the slice, so a routed leaf maps straight back to
+// its Cluster. The leaves keep their own routing and open-segment caches; the
+// aggregator adds only the summary, the routed fan-out, and the merge.
 func OpenAggregator(leaves []*Cluster) *Aggregator {
-	return &Aggregator{leaves: leaves, stats: newFleetStats(leaves)}
+	srcs := make([]search.RoutingSource, len(leaves))
+	for i, l := range leaves {
+		srcs[i] = l.Routing()
+	}
+	return &Aggregator{leaves: leaves, summary: search.BuildRouting(srcs)}
 }
 
 // Stats exposes the fleet statistics, for callers that want to score or route with
-// the same corpus-wide IDF the aggregator uses.
-func (a *Aggregator) Stats() search.GlobalStats { return a.stats }
+// the same corpus-wide IDF the aggregator uses. It is the box-level summary, which
+// satisfies search.GlobalStats.
+func (a *Aggregator) Stats() search.GlobalStats { return a.summary }
+
+// Summary exposes the box-level routing summary, for stats and for persisting it as
+// a sidecar the way a Cluster persists its own routing.
+func (a *Aggregator) Summary() *search.RoutingIndex { return a.summary }
 
 // NumLeaves is how many leaf clusters the aggregator fans out to.
 func (a *Aggregator) NumLeaves() int { return len(a.leaves) }
@@ -95,7 +92,7 @@ func (a *Aggregator) NumShards() int {
 }
 
 // NumDocs is the fleet-wide live document count.
-func (a *Aggregator) NumDocs() int { return a.stats.NumDocs() }
+func (a *Aggregator) NumDocs() int { return a.summary.NumDocs() }
 
 // Close closes every leaf cluster.
 func (a *Aggregator) Close() error {
@@ -108,45 +105,57 @@ func (a *Aggregator) Close() error {
 	return first
 }
 
-// AggStats reports how a fan-out query was answered: how many leaves it touched,
-// and the totals of the per-leaf routing and pruning. ShardsVisited well below
-// Candidates is the pruning that keeps the budget; Candidates well below the fleet
-// shard count is the routing that keeps it.
+// AggStats reports how a routed fan-out query was answered: how many leaves the
+// fleet holds, how many the summary routed to, and the totals of the per-leaf
+// routing and pruning across the routed leaves. LeavesVisited well below Leaves is
+// the box-level routing that skips leaves holding no query term; ShardsVisited well
+// below Candidates is the per-leaf pruning; Candidates well below the fleet shard
+// count is the per-leaf routing. Every layer keeps the answer exact.
 type AggStats struct {
-	Leaves        int // leaves queried
-	Candidates    int // candidate shards across all leaves
-	ShardsVisited int // shards actually opened and scored across all leaves
+	Leaves        int // leaves in the fleet
+	LeavesVisited int // leaves the summary routed to and fanned out to
+	Candidates    int // candidate shards across the routed leaves
+	ShardsVisited int // shards actually opened and scored across the routed leaves
 }
 
-// Search fans the query out to every leaf concurrently, each leaf routing, pruning,
-// and scoring its own shards against the fleet statistics, then merges the leaves'
-// partial top-k lists into one fleet-wide top-k. It dedups a page surfaced by more
-// than one leaf after a recrawl by its stable doc_id and keeps the highest-scoring
-// copy, the same discipline the leaf broker uses within itself. The total order is
-// score descending then doc_id ascending, identical to a single broker over every
-// shard, so the result is byte-identical to that broker.
+// Search routes the query on the box-level summary to the leaves that can hold it,
+// fans out to those leaves concurrently, each leaf routing, pruning, and scoring its
+// own shards against the fleet statistics, then merges the leaves' partial top-k
+// lists into one fleet-wide top-k. It dedups a page surfaced by more than one leaf
+// after a recrawl by its stable doc_id and keeps the highest-scoring copy, the same
+// discipline the leaf broker uses within itself. The total order is score descending
+// then doc_id ascending, identical to a single broker over every shard, and a leaf
+// the summary skips holds no query term so it could contribute nothing, so the
+// result is byte-identical to that broker.
 func (a *Aggregator) Search(query string, k int) ([]SearchResult, AggStats, error) {
 	if k <= 0 {
 		return nil, AggStats{}, nil
 	}
+	terms := tokenize(query)
+	route := a.summary.RouteWith(terms, a.summary)
+	agg := AggStats{Leaves: len(a.leaves), LeavesVisited: len(route)}
+	if len(route) == 0 {
+		return nil, agg, nil
+	}
+
 	type leafOut struct {
 		res   []SearchResult
 		stats QueryStats
 		err   error
 	}
-	outs := make([]leafOut, len(a.leaves))
+	outs := make([]leafOut, len(route))
 	var wg sync.WaitGroup
-	for i := range a.leaves {
+	for i := range route {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			res, st, err := a.leaves[i].SearchWith(query, k, a.stats)
+			leaf := a.leaves[route[i].Shard]
+			res, st, err := leaf.SearchWith(query, k, a.summary)
 			outs[i] = leafOut{res: res, stats: st, err: err}
 		}(i)
 	}
 	wg.Wait()
 
-	agg := AggStats{Leaves: len(a.leaves)}
 	lists := make([][]SearchResult, 0, len(outs))
 	for _, o := range outs {
 		if o.err != nil {

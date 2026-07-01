@@ -288,6 +288,32 @@ func (ri *RoutingIndex) ShardDocs(shard int) int {
 	return ri.shardDocs[shard]
 }
 
+// LiveDocs is the collection total, so a RoutingIndex satisfies RoutingSource and
+// can be folded into a higher-level routing index as if it were one shard. That is
+// what the cross-box broker does at 1B: it builds a routing index whose shards are
+// boxes by adding each box's own routing index as a source (scale/11 lever four).
+func (ri *RoutingIndex) LiveDocs() int { return ri.totalDocs }
+
+// EachTerm iterates the collection's terms, giving each its collection-wide
+// document frequency and the maximum in-document frequency it reaches anywhere in
+// the collection, which is the max over its per-shard maxima. Folded into a
+// higher-level builder, this summarizes a whole box as one shard: the box's df is a
+// term's fleet-frequency contribution and the box's maxFreq is the ceiling any
+// document in the box can score, so the box bound stays a true upper bound and the
+// two-level prune stays exact (scale/11 lever four).
+func (ri *RoutingIndex) EachTerm(fn func(term string, df int, maxFreq uint32)) {
+	n := ri.numTerms()
+	for i := 0; i < n; i++ {
+		var mx uint32
+		for j := ri.postOff[i]; j < ri.postOff[i+1]; j++ {
+			if ri.postMax[j] > mx {
+				mx = ri.postMax[j]
+			}
+		}
+		fn(string(ri.termAt(i)), int(ri.globalDF[i]), mx)
+	}
+}
+
 // EachPosting calls fn for every (term, shard) posting in the index, with the
 // term's document frequency and maximum in-document frequency in that shard. It is
 // for measurement and for re-serializing into a different layout; the order is

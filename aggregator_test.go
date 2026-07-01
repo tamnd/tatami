@@ -89,6 +89,71 @@ func TestAggregatorExactVsSingleCluster(t *testing.T) {
 	}
 }
 
+// TestAggregatorRoutesToBoxes checks the lever-four win: the box-level summary routes
+// a query to the leaves that hold it and the fan-out skips the rest, so a term living
+// in one leaf's shards visits one leaf while a term in every leaf still visits every
+// leaf. The routing is what prunes, so the result stays exact alongside, asserted
+// against the single-broker oracle.
+func TestAggregatorRoutesToBoxes(t *testing.T) {
+	dir := t.TempDir()
+	// Twenty shards, every shard holds "common"; each shard's filler docs carry
+	// per-shard unique terms, so a unique term lives in exactly one shard, hence one
+	// leaf once the shards are split into leaves.
+	hot := make([]int, 20)
+	for i := range hot {
+		hot[i] = 1
+	}
+	paths := clusterCorpus(t, dir, hot)
+
+	single, err := OpenCluster(paths, ClusterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer single.Close()
+
+	leaves := partition(t, paths, 4, 0) // 4 leaves of 5 shards
+	agg := OpenAggregator(leaves)
+	defer agg.Close()
+
+	// A term in every shard fans out to every leaf.
+	_, cs, err := agg.Search("common", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("common: visited %d of %d leaves", cs.LeavesVisited, cs.Leaves)
+	if cs.LeavesVisited != agg.NumLeaves() {
+		t.Fatalf("common should visit all %d leaves, visited %d", agg.NumLeaves(), cs.LeavesVisited)
+	}
+
+	// A term unique to shard 2 (in leaf 0, shards 0-4) visits exactly one leaf.
+	const uniq = "unique0203" // shard 02, filler doc 03
+	_, us, err := agg.Search(uniq, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%s: visited %d of %d leaves", uniq, us.LeavesVisited, us.Leaves)
+	if us.LeavesVisited != 1 {
+		t.Fatalf("a shard-unique term should visit 1 leaf, visited %d", us.LeavesVisited)
+	}
+
+	// The routing did not change the answer, for a per-leaf term and a fleet-wide one.
+	for _, q := range []string{uniq, "common", "common alpha"} {
+		for _, k := range []int{1, 5, 25} {
+			want, _, err := single.Search(q, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _, err := agg.Search(q, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameResults(got, want) {
+				t.Fatalf("q=%q k=%d: routed fleet differs from single broker\n got  %+v\n want %+v", q, k, got, want)
+			}
+		}
+	}
+}
+
 // TestAggregatorFleetStats checks that the aggregator's fleet statistics are the
 // sum across leaves, the property that makes a leaf's IDF identical to a single
 // broker's and the cross-leaf merge exact.

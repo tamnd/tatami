@@ -74,6 +74,59 @@ func TestRoutingBuildStats(t *testing.T) {
 	}
 }
 
+// TestRoutingIndexAsSource checks that a RoutingIndex folds into a higher-level
+// routing builder as one shard, the building block of the cross-box summary (scale/11
+// lever four). A summary built over two per-box indexes must report the fleet total
+// as its NumDocs, the sum of a term's per-box frequency as its DocFreq, and the max
+// of a term's per-box ceiling frequency as the box's routing max, so a box bound
+// stays a true upper bound on any score in the box.
+func TestRoutingIndexAsSource(t *testing.T) {
+	// Box 0: two shards, "alpha" reaching maxFreq 3 then 7 across them.
+	box0 := BuildRouting([]RoutingSource{
+		fakeShard{live: 60, terms: map[string]fakeTerm{"alpha": {df: 10, maxFreq: 3}, "beta": {df: 4, maxFreq: 2}}},
+		fakeShard{live: 40, terms: map[string]fakeTerm{"alpha": {df: 8, maxFreq: 7}}},
+	})
+	// Box 1: one shard with "alpha" and "gamma".
+	box1 := BuildRouting([]RoutingSource{
+		fakeShard{live: 50, terms: map[string]fakeTerm{"alpha": {df: 5, maxFreq: 4}, "gamma": {df: 9, maxFreq: 1}}},
+	})
+
+	summary := BuildRouting([]RoutingSource{box0, box1})
+
+	if summary.NumDocs() != 150 {
+		t.Fatalf("summary NumDocs = %d, want 150 (60+40+50)", summary.NumDocs())
+	}
+	if summary.NumShards() != 2 {
+		t.Fatalf("summary NumShards = %d, want 2 boxes", summary.NumShards())
+	}
+	// alpha: box0 df 10+8=18, box1 df 5, fleet 23.
+	if got := summary.DocFreq("alpha"); got != 23 {
+		t.Fatalf("summary DocFreq(alpha) = %d, want 23", got)
+	}
+	if got := summary.DocFreq("beta"); got != 4 {
+		t.Fatalf("summary DocFreq(beta) = %d, want 4", got)
+	}
+	if got := summary.ShardDocs(0); got != 100 {
+		t.Fatalf("box 0 docs = %d, want 100", got)
+	}
+
+	// The box-0 bound for alpha must use box 0's ceiling frequency, the max over its
+	// shards (7), scored with the fleet IDF, so it upper-bounds any alpha score in the
+	// box. Box 0 sorts ahead of box 1 because 7 beats box 1's 4.
+	route := summary.Route([]string{"alpha"})
+	if len(route) != 2 {
+		t.Fatalf("Route(alpha) returned %d boxes, want 2", len(route))
+	}
+	if route[0].Shard != 0 || route[1].Shard != 1 {
+		t.Fatalf("box order = %+v, want box 0 then 1", route)
+	}
+	col := Collection{N: 150}
+	sc := bm25Scorer{idf: col.IDF(23), k1: DefaultK1}
+	if want := sc.MaxScore(7); route[0].Bound != want {
+		t.Fatalf("box 0 bound = %v, want %v (fleet IDF times ceiling freq 7)", route[0].Bound, want)
+	}
+}
+
 // TestRouteOrderAndBound checks that Route returns only shards holding a query
 // term, ordered by a descending bound, and that the bound equals the global-IDF
 // impact the broker scores against.
