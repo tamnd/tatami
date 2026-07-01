@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/tamnd/tatami/search"
 )
 
 // These tests prove the aggregator tier against a single-broker oracle: fanning a
@@ -149,6 +151,123 @@ func TestAggregatorRoutesToBoxes(t *testing.T) {
 			}
 			if !sameResults(got, want) {
 				t.Fatalf("q=%q k=%d: routed fleet differs from single broker\n got  %+v\n want %+v", q, k, got, want)
+			}
+		}
+	}
+}
+
+// TestAggregatorPhraseRoutesToBoxes checks the box-level phrase route: a phrase whose
+// words are common but whose adjacency is rare fans out to every leaf as a bag of
+// words, but routes only to the leaves holding the adjacency as a phrase, the fleet
+// analogue of a Cluster's own phrase routing (M5) one level up. Every shard holds
+// "open" and "source" as words but only two shards, falling in two leaves, hold them
+// adjacent, so the bag route visits all four leaves and the phrase route visits two,
+// with the answer exact against a single-broker phrase oracle.
+func TestAggregatorPhraseRoutesToBoxes(t *testing.T) {
+	dir := t.TempDir()
+	const nShards, nLeaves = 20, 4
+	adj := map[int]bool{2: true, 13: true} // shards holding the "open source" adjacency, in leaves 0 and 2
+
+	var paths []string
+	builders := make([]*SearchBuilder, nShards)
+	for s := 0; s < nShards; s++ {
+		b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true})
+		for i := 0; i < 10; i++ {
+			// "open" and "source" appear as words but not adjacent, so the bag route of
+			// "open source" hits this shard while the phrase route does not.
+			b.Add(SearchDoc{
+				DocID: fmt.Sprintf("doc-%02d-%02d", s, i),
+				URL:   fmt.Sprintf("https://shard%02d.example/%d", s, i),
+				Title: fmt.Sprintf("shard %d doc %d", s, i),
+				Body:  "open alpha source beta",
+			})
+		}
+		if adj[s] {
+			b.Add(SearchDoc{
+				DocID: fmt.Sprintf("doc-%02d-phrase", s),
+				URL:   fmt.Sprintf("https://shard%02d.example/phrase", s),
+				Title: fmt.Sprintf("shard %d phrase", s),
+				Body:  "open source software",
+			})
+		}
+		p := filepath.Join(dir, fmt.Sprintf("seg-%03d.tatami", s))
+		if err := b.Write(p, WriterOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		builders[s] = b
+		paths = append(paths, p)
+	}
+
+	// Single-broker phrase oracle: one cluster over every shard with a global sidecar.
+	single, err := OpenCluster(paths, ClusterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer single.Close()
+	gbb := search.NewBigramRoutingBuilder()
+	for s := range paths {
+		gbb.AddShard(uint32(s), builders[s])
+	}
+	single = single.WithBigramRouting(gbb.Build())
+
+	// Partition into four leaves of five shards, each leaf carrying its own sidecar
+	// over its shards under leaf-local ids, exactly as a real box would.
+	per := nShards / nLeaves
+	var leaves []*Cluster
+	for lf := 0; lf < nLeaves; lf++ {
+		lo := lf * per
+		hi := lo + per
+		lc, err := OpenCluster(paths[lo:hi], ClusterOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lbb := search.NewBigramRoutingBuilder()
+		for j := lo; j < hi; j++ {
+			lbb.AddShard(uint32(j-lo), builders[j])
+		}
+		leaves = append(leaves, lc.WithBigramRouting(lbb.Build()))
+	}
+	agg := OpenAggregator(leaves)
+	defer agg.Close()
+
+	// Bag route: both words live in every shard, so the fan-out hits every leaf.
+	_, bag, err := agg.Search("open source", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bag.LeavesVisited != agg.NumLeaves() {
+		t.Fatalf("bag route should visit all %d leaves, visited %d", agg.NumLeaves(), bag.LeavesVisited)
+	}
+
+	// Phrase route: the adjacency lives in shards 2 and 13, in leaves 0 and 2, so the
+	// fan-out visits exactly those two leaves and fewer shards than the bag route.
+	_, ph, err := agg.SearchPhrase("open source", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("open source: bag visited %d leaves/%d shards, phrase visited %d leaves/%d shards",
+		bag.LeavesVisited, bag.ShardsVisited, ph.LeavesVisited, ph.ShardsVisited)
+	if ph.LeavesVisited != 2 {
+		t.Fatalf("phrase route should visit 2 leaves, visited %d", ph.LeavesVisited)
+	}
+	if ph.ShardsVisited >= bag.ShardsVisited {
+		t.Fatalf("phrase route visited %d shards, bag route %d; phrase should visit fewer", ph.ShardsVisited, bag.ShardsVisited)
+	}
+
+	// The routing did not change the answer, for a rare adjacency, a longer phrase, and
+	// a common adjacency, each checked against the single-broker phrase oracle.
+	for _, q := range []string{"open source", "open source software", "source beta"} {
+		for _, k := range []int{1, 5, 25} {
+			want, _, err := single.SearchPhrase(q, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _, err := agg.SearchPhrase(q, k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameResults(got, want) {
+				t.Fatalf("q=%q k=%d: routed fleet phrase differs from single broker\n got  %+v\n want %+v", q, k, got, want)
 			}
 		}
 	}

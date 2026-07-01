@@ -134,6 +134,11 @@ func (c *Cluster) WithBigramRouting(br *search.BigramRouting) *Cluster {
 	return c
 }
 
+// Bigram exposes the phrase routing sidecar, or nil when none is attached, so a
+// box's adjacencies can fold into a box-level phrase sidecar the way Routing exposes
+// the unigram index for the box-level unigram summary.
+func (c *Cluster) Bigram() *search.BigramRouting { return c.bigram }
+
 // NumShards is how many shards the cluster serves.
 func (c *Cluster) NumShards() int { return len(c.paths) }
 
@@ -456,6 +461,40 @@ func (c *Cluster) SearchWith(query string, k int, stats search.GlobalStats) ([]S
 	}
 	terms := tokenize(query)
 	bounds := c.routing.RouteWith(terms, stats)
+	return c.searchBounds(terms, k, stats, bounds)
+}
+
+// SearchPhrase is the fielded phrase path: it narrows the candidate shards to those
+// holding one of the phrase's adjacencies before scoring and fetching fields,
+// mirroring QueryPhrase on the retrieval side. It is the single-broker phrase oracle
+// the aggregator's routed phrase fan-out is checked against.
+func (c *Cluster) SearchPhrase(query string, k int) ([]SearchResult, QueryStats, error) {
+	return c.SearchPhraseWith(query, k, c.routing)
+}
+
+// SearchPhraseWith is SearchPhrase with corpus statistics supplied from outside, the
+// aggregator path. It routes the phrase on the bigram sidecar and, when the route is
+// exact (a sidecar is attached and every adjacency is tracked), scores and fetches
+// over the adjacency shards; otherwise it falls back to the bag route SearchWith, so
+// the answer is never wrong, only wider. It mirrors QueryPhraseWith field-for-field.
+func (c *Cluster) SearchPhraseWith(query string, k int, stats search.GlobalStats) ([]SearchResult, QueryStats, error) {
+	if k <= 0 {
+		return nil, QueryStats{}, nil
+	}
+	terms := tokenize(query)
+	if bounds, ok := c.phraseBounds(terms, stats); ok {
+		return c.searchBounds(terms, k, stats, bounds)
+	}
+	return c.SearchWith(query, k, stats)
+}
+
+// searchBounds runs the fielded routed search over a precomputed candidate set: it
+// walks the shards in descending bound order, seeds each shard's WAND with the
+// running k-th best distinct score, over-fetches per shard so duplicates collapsing
+// cannot leave fewer than k results, dedups a page carried by more than one shard by
+// its stable doc_id, and fetches url and title of the survivors. Both SearchWith and
+// SearchPhraseWith reach it, differing only in how they routed the candidate set.
+func (c *Cluster) searchBounds(terms []string, k int, stats search.GlobalStats, bounds []search.ShardBound) ([]SearchResult, QueryStats, error) {
 	qstats := QueryStats{Candidates: len(bounds)}
 	// Over-fetch per shard so duplicates collapsing cannot leave fewer than k
 	// distinct results, and so a tie at the k-th score keeps the doc_id-smaller

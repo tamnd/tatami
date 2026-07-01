@@ -256,6 +256,29 @@ func (br *BigramRouting) KeepCommon(unigram *RoutingIndex, minDF int) *BigramRou
 	return out
 }
 
+// EachBigram iterates the sidecar's adjacent pairs, giving each its collection-wide
+// document frequency and the maximum in-document adjacency count it reaches in any
+// one shard, so a BigramRouting satisfies BigramSource and folds into a higher-level
+// bigram sidecar as one shard. This is the phrase-routing counterpart to
+// RoutingIndex.EachTerm: it lets a box's own phrase sidecar become one posting in a
+// box-level phrase sidecar, so a top broker routes a phrase to the boxes holding its
+// adjacency exactly as a leaf routes it to the shards holding its adjacency. The
+// document frequency is the pair's global df (its sum across the box's shards) and
+// the ceiling frequency is the max over the box's shards, so a box's phrase bound
+// stays a true upper bound one level up.
+func (br *BigramRouting) EachBigram(fn func(a, b string, df int, maxFreq uint32)) {
+	n := br.numPairs()
+	for i := 0; i < n; i++ {
+		var mx uint32
+		for j := br.postOff[i]; j < br.postOff[i+1]; j++ {
+			if br.postMax[j] > mx {
+				mx = br.postMax[j]
+			}
+		}
+		fn(string(br.aAt(i)), string(br.bAt(i)), int(br.globalDF[i]), mx)
+	}
+}
+
 // NumPairs is how many distinct adjacent pairs the sidecar tracks.
 func (br *BigramRouting) NumPairs() int { return br.numPairs() }
 
