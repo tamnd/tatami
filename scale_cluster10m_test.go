@@ -65,6 +65,16 @@ func maxShards() int { return envInt("TATAMI_MAX_SHARDS", 0) }
 // threshold sharing keep bounded. The 10M run sets this so the routing index fits.
 func filesPerShard() int { return envInt("TATAMI_FILES_PER_SHARD", 1) }
 
+// targetShards is the coarsening lever (scale/11 lever one): the number of shards
+// to aim for regardless of how many Parquet files the corpus has. Zero (the
+// default) leaves the split to filesPerShard. When set, the pipeline groups the
+// files so the shard count lands near this target, so the same target yields ~128
+// shards whether the corpus is 500 files or 5,000. The right target is a small
+// multiple of the serving box's cores: past that the fan-out stops parallelizing
+// and every extra shard is fixed per-shard cost with nothing to hide it under,
+// while below it each shard's posting walk grows until a common term breaks budget.
+func targetShards() int { return envInt("TATAMI_TARGET_SHARDS", 0) }
+
 // chunkFiles groups paths into runs of up to per files, preserving order, so each
 // run becomes one shard.
 func chunkFiles(paths []string, per int) [][]string {
@@ -205,6 +215,12 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 
 		sort.Strings(matches)
 		per := filesPerShard()
+		// The coarsening lever overrides the fixed files-per-shard: given a target
+		// shard count, group the files so the count lands near it, so the shard count
+		// tracks the box, not the corpus size (scale/11 lever one).
+		if ts := targetShards(); ts > 0 && ts < len(matches) {
+			per = (len(matches) + ts - 1) / ts
+		}
 		// A shard cap bounds the work for a smoke run. It caps the number of shards,
 		// so it consumes at most cap*per input files.
 		if cap := maxShards(); cap > 0 && cap*per < len(matches) {
