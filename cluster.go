@@ -25,7 +25,11 @@ package tatami
 // every shard.
 
 import (
+	"math"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/tatami/search"
 )
@@ -210,34 +214,181 @@ func (c *Cluster) phraseBounds(terms []string, stats search.GlobalStats) ([]sear
 // QueryPhrase reach it, differing only in how they routed the candidate set.
 func (c *Cluster) runQuery(terms []string, k int, stats search.GlobalStats, bounds []search.ShardBound) ([]ClusterHit, QueryStats, error) {
 	qstats := QueryStats{Candidates: len(bounds)}
+	if len(bounds) == 0 {
+		return nil, qstats, nil
+	}
 
-	var cands []ClusterHit
+	// Parallel shard fan-out (scale/07 part 4, the lever-5 scheduler). The serial
+	// walk visited routed shards one at a time, so a common phrase whose adjacency
+	// lives in nearly every shard paid the sum of every per-shard walk. Measured at
+	// 10M that was ~47ms across ~469 shards even though each walk was ~100us. The
+	// shards are independent and the segment cache is safe for concurrent readers,
+	// so the broker scores them in parallel and only the merge into the top-k heap
+	// is serial.
+	//
+	// The design is a barrier-free worker pool over the bound-descending shard list,
+	// not fixed waves. A wave-at-a-time fan-out pays its slowest shard on every wave
+	// and forces every shard in a wave to share one stale threshold, so it both
+	// stalls on the tail and prunes worse than the serial walk did. The pool hands
+	// each free worker the next shard by an atomic counter, so a fast core naturally
+	// claims more shards than a slow one and the fan-out self-balances.
+	//
+	// The threshold that seeds and prunes each shard is the ONE global k-th, held in a
+	// single shared heap, published into an atomic word workers read lock-free. Per-
+	// worker heaps were tried and lost: a worker that has seen only a handful of shards
+	// holds a weak local k-th, so it seeds SearchTermsSeeded with a loose floor and the
+	// per-shard WAND prunes far less, which at 10M turned an 8ms phrase into 120ms. A
+	// strong global seed is worth more than a lock-free merge. To keep the merge from
+	// convoying on that one heap, a worker does not lock per hit: it buffers a shard's
+	// survivors, then takes the heap mutex ONCE per shard to fold them in and re-read
+	// the risen k-th. That is a few hundred lock acquisitions for a whole query instead
+	// of one per hit, which is what pinned a flat-scored phrase ("download free", whose
+	// hits all tie at the k-th and so none are dropped before the lock) near the serial
+	// time.
 	th := newMinHeap(k)
-	for _, sb := range bounds {
-		if th.full() && sb.Bound < th.min() {
-			break
+	var (
+		hmu         sync.Mutex // guards th and cands
+		cands       []ClusterHit
+		warmVisited int
+		visited     int64  // shards scored by the pool, summed with atomic adds
+		next        int64  // next shard index to claim, in descending bound order
+		kthBits     uint32 // published k-th score (float32 bits), read without a lock
+		full        int32  // 1 once k hits have been seen, read without a lock
+		stopped     int32  // 1 once a shard's bound fell below the k-th; the rest cannot contribute
+		failed      int32  // 1 once a shard failed to open
+		failErr     error
+	)
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(bounds) {
+		workers = len(bounds)
+	}
+
+	loadKth := func() search.Score {
+		return search.Score(math.Float32frombits(atomic.LoadUint32(&kthBits)))
+	}
+	// publishKth mirrors the shared heap's current k-th into the atomic word, called
+	// under hmu right after folding a shard's survivors in. The heap only rises, so the
+	// published value only rises; workers read it lock-free to seed and prune.
+	publishKth := func() {
+		if th.full() {
+			atomic.StoreUint32(&kthBits, math.Float32bits(float32(th.min())))
+			atomic.StoreInt32(&full, 1)
 		}
-		// Cross-shard threshold sharing (scale/07, M5): once the broker has filled
-		// the global top-k, its running k-th best is a true lower bound on the final
-		// global k-th, so it seeds this shard's WAND. The shard then prunes documents
-		// that cannot beat the global threshold before it scores them, doing less work
-		// for the same merged result. Zero until the heap is full, which is the
-		// unseeded path for the first shards.
-		var seed search.Score
-		if th.full() && !c.noSeed {
-			seed = th.min()
-		}
-		h, err := c.cache.acquire(int(sb.Shard))
+	}
+
+	// Serial warm-up: score shards in descending bound order until the heap holds k
+	// hits, so the k-th is established before the fan-out. Without it every worker
+	// that starts before the heap fills reads full=0, cannot seed or prune, and pays
+	// a blind full walk. A narrow query fills the heap from its first shard or two,
+	// and the pool below then prunes the rest against a strong threshold. The warm-up
+	// is exact: it is the serial walk's own prefix.
+	start := 0
+	for ; start < len(bounds) && !th.full(); start++ {
+		h, err := c.cache.acquire(int(bounds[start].Shard))
 		if err != nil {
 			return nil, qstats, err
 		}
-		qstats.Visited++
-		for _, hit := range h.seg.SearchTermsSeeded(terms, k, stats, seed) {
-			cands = append(cands, ClusterHit{Shard: int(sb.Shard), Doc: uint32(hit.Doc), Score: float32(hit.Score)})
+		warmVisited++
+		for _, hit := range h.seg.SearchTermsSeeded(terms, k, stats, 0) {
+			cands = append(cands, ClusterHit{Shard: int(bounds[start].Shard), Doc: uint32(hit.Doc), Score: float32(hit.Score)})
 			th.push(hit.Score)
 		}
 		c.cache.release(h)
 	}
+	publishKth()
+	next = int64(start)
+
+	// A narrow query is answered by the warm-up: either it exhausted the shards or
+	// the k-th it drove up already beats every remaining bound. Skip the fan-out so
+	// it never pays to spawn the pool, whose goroutine scheduling is what puts a
+	// scheduler-quantum floor under an otherwise sub-millisecond query. The pool cap
+	// also drops to the shards that are actually left.
+	fanout := start < len(bounds) && !(th.full() && bounds[start].Bound < th.min())
+	if fanout && workers > len(bounds)-start {
+		workers = len(bounds) - start
+	}
+
+	var wg sync.WaitGroup
+	if fanout {
+		wg.Add(workers)
+	}
+	for w := 0; fanout && w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			var batch []ClusterHit
+			var lvisited int64
+			for {
+				if atomic.LoadInt32(&stopped) == 1 || atomic.LoadInt32(&failed) == 1 {
+					break
+				}
+				idx := int(atomic.AddInt64(&next, 1)) - 1
+				if idx >= len(bounds) {
+					break
+				}
+				// The claim counter hands shards out in descending bound order, so the
+				// first shard whose bound cannot beat the published k-th prunes the
+				// rest: every later index has a lower bound and every earlier index was
+				// already claimed. The seed is the published global k-th, a true lower
+				// bound on the answer's k-th, so seeded scoring drops only documents
+				// that could not have entered it.
+				var seed search.Score
+				if atomic.LoadInt32(&full) == 1 {
+					kth := loadKth()
+					if bounds[idx].Bound < kth {
+						atomic.StoreInt32(&stopped, 1)
+						break
+					}
+					if !c.noSeed {
+						seed = kth
+					}
+				}
+
+				h, err := c.cache.acquire(int(bounds[idx].Shard))
+				if err != nil {
+					hmu.Lock()
+					if failErr == nil {
+						failErr = err
+					}
+					hmu.Unlock()
+					atomic.StoreInt32(&failed, 1)
+					break
+				}
+				hits := h.seg.SearchTermsSeeded(terms, k, stats, seed)
+				c.cache.release(h)
+				lvisited++
+
+				// Buffer this shard's survivors, then fold them into the shared heap
+				// once. Dropping a hit below the current published k-th needs no lock;
+				// the buffered remainder takes the heap mutex a single time per shard.
+				batch = batch[:0]
+				for _, hit := range hits {
+					if atomic.LoadInt32(&full) == 1 && hit.Score < loadKth() {
+						continue
+					}
+					batch = append(batch, ClusterHit{Shard: int(bounds[idx].Shard), Doc: uint32(hit.Doc), Score: float32(hit.Score)})
+				}
+				if len(batch) > 0 {
+					hmu.Lock()
+					for _, ch := range batch {
+						cands = append(cands, ch)
+						th.push(search.Score(ch.Score))
+					}
+					publishKth()
+					hmu.Unlock()
+				}
+			}
+			atomic.AddInt64(&visited, lvisited)
+		}()
+	}
+	wg.Wait()
+	if failErr != nil {
+		return nil, qstats, failErr
+	}
+	qstats.Visited = warmVisited + int(visited)
 	if th.full() {
 		qstats.Threshold = float32(th.min())
 	}
