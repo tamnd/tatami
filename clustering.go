@@ -19,8 +19,10 @@ package tatami
 // tatami skips on a proven bound and loses nothing.
 
 import (
-	"hash/fnv"
 	"math"
+	"runtime"
+	"sort"
+	"sync"
 )
 
 // ClusterPlanOptions tunes a content clustering. Shards is the number of clusters,
@@ -75,10 +77,18 @@ type ContentClusterer struct {
 // is what makes a rebuild of the same corpus yield the same clustering.
 func featureVector(tokens []string, dims int) []float32 {
 	v := make([]float32, dims)
+	d := uint32(dims)
 	for _, t := range tokens {
-		h := fnv.New32a()
-		h.Write([]byte(t))
-		v[h.Sum32()%uint32(dims)]++
+		// FNV-1a inlined over the token's bytes: the same hash hash/fnv.New32a computes,
+		// without allocating a hasher (and a []byte copy of the string) per token, which
+		// on a corpus of long web documents is tens of millions of allocations the fit
+		// otherwise pays before it does any arithmetic.
+		h := uint32(2166136261)
+		for i := 0; i < len(t); i++ {
+			h ^= uint32(t[i])
+			h *= 16777619
+		}
+		v[h%d]++
 	}
 	normalize(v)
 	return v
@@ -110,6 +120,37 @@ func dot(a, b []float32) float32 {
 	return s
 }
 
+// parallelChunks splits [0,n) into up to GOMAXPROCS contiguous ranges and runs fn on
+// each concurrently, waiting for all to finish. Every index is covered by exactly one
+// range, so a callback that writes per-index state needs no synchronization. It is the
+// fit's parallelism: the centroid scans over the sample are the fit's cost and each
+// vector is independent.
+func parallelChunks(n int, fn func(lo, hi int)) {
+	if n == 0 {
+		return
+	}
+	workers := min(runtime.GOMAXPROCS(0), n)
+	if workers <= 1 {
+		fn(0, n)
+		return
+	}
+	chunk := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := range workers {
+		lo := w * chunk
+		if lo >= n {
+			break
+		}
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			fn(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
 // FitClusterer learns the cluster centroids from a sample of documents by spherical
 // k-means over their feature vectors. The sample bounds the fit cost: a few tens of
 // thousands of documents pin the topic structure and more only refines it. The
@@ -121,9 +162,11 @@ func FitClusterer(sample [][]string, opts ClusterPlanOptions) *ContentClusterer 
 	k, dims := opts.Shards, opts.Dims
 
 	vecs := make([][]float32, len(sample))
-	for i, toks := range sample {
-		vecs[i] = featureVector(toks, dims)
-	}
+	parallelChunks(len(sample), func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			vecs[i] = featureVector(sample[i], dims)
+		}
+	})
 
 	c := &ContentClusterer{dims: dims}
 	if len(vecs) == 0 {
@@ -147,27 +190,69 @@ func FitClusterer(sample [][]string, opts ClusterPlanOptions) *ContentClusterer 
 	}
 	c.centroids = make([][]float32, 0, k)
 	c.centroids = append(c.centroids, append([]float32(nil), vecs[start]...))
+	// Track each sample's similarity to its nearest chosen centroid and update it as
+	// each new centroid is added, so the farthest-first pick is an argmin over this
+	// slice rather than a rescan against every centroid chosen so far. Maintaining the
+	// running nearest makes the init O(K*n*d) instead of O(K^2*n*d): nearest[i] is
+	// exactly the max dot a from-scratch rescan would recompute.
+	nearest := make([]float32, len(vecs))
+	first := c.centroids[0]
+	parallelChunks(len(vecs), func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			nearest[i] = dot(vecs[i], first)
+		}
+	})
 	for len(c.centroids) < k {
-		c.centroids = append(c.centroids, worstFit(vecs, c.centroids))
+		worst, worstDot := 0, float32(2)
+		for i, s := range nearest {
+			if s < worstDot {
+				worst, worstDot = i, s
+			}
+		}
+		nc := append([]float32(nil), vecs[worst]...)
+		c.centroids = append(c.centroids, nc)
+		parallelChunks(len(vecs), func(lo, hi int) {
+			for i := lo; i < hi; i++ {
+				if d := dot(vecs[i], nc); d > nearest[i] {
+					nearest[i] = d
+				}
+			}
+		})
 	}
 
 	assign := make([]int, len(vecs))
+	bestDots := make([]float32, len(vecs))
 	for it := 0; it < opts.Iters; it++ {
+		// The per-vector nearest-centroid scan is the fit's cost and every vector is
+		// independent, so it parallelizes over disjoint ranges: each worker writes only
+		// its own assign entries, and the change flag folds in under a lock. Each vector's
+		// similarity to its chosen centroid is kept in bestDots so an empty cluster can be
+		// reseeded from the worst-fitting vectors without a fresh O(n*k*d) rescan.
 		changed := false
-		for i, v := range vecs {
-			best, bestDot := 0, float32(-2)
-			for j := range c.centroids {
-				if d := dot(v, c.centroids[j]); d > bestDot {
-					best, bestDot = j, d
+		var chMu sync.Mutex
+		parallelChunks(len(vecs), func(lo, hi int) {
+			local := false
+			for i := lo; i < hi; i++ {
+				v := vecs[i]
+				best, bestDot := 0, float32(-2)
+				for j := range c.centroids {
+					if d := dot(v, c.centroids[j]); d > bestDot {
+						best, bestDot = j, d
+					}
+				}
+				bestDots[i] = bestDot
+				if assign[i] != best {
+					assign[i] = best
+					local = true
 				}
 			}
-			if assign[i] != best {
-				assign[i] = best
+			if local {
+				chMu.Lock()
 				changed = true
+				chMu.Unlock()
 			}
-		}
-		// Recompute each centroid as the normalized mean of its members. An empty
-		// cluster is reseeded to the worst-fit sample point so it does not stay dead.
+		})
+		// Recompute each centroid as the normalized mean of its members.
 		sums := make([][]float32, k)
 		counts := make([]int, k)
 		for j := range sums {
@@ -180,9 +265,26 @@ func FitClusterer(sample [][]string, opts ClusterPlanOptions) *ContentClusterer 
 				sums[j][d] += v[d]
 			}
 		}
+		// Reseed empty clusters from the worst-fitting vectors so a dead cluster does
+		// not stay dead. bestDots already ranks every vector by how well it fits its
+		// nearest centroid, so the worst fits are an order over that slice, taken once
+		// and distinct, which is O(n log n) only in the rare iteration that empties a
+		// cluster rather than O(n*k*d) per empty cluster.
+		var worstOrder []int
+		nextWorst := 0
 		for j := range c.centroids {
 			if counts[j] == 0 {
-				c.centroids[j] = worstFit(vecs, c.centroids)
+				if worstOrder == nil {
+					worstOrder = make([]int, len(vecs))
+					for i := range worstOrder {
+						worstOrder[i] = i
+					}
+					sort.Slice(worstOrder, func(a, b int) bool {
+						return bestDots[worstOrder[a]] < bestDots[worstOrder[b]]
+					})
+				}
+				c.centroids[j] = append([]float32(nil), vecs[worstOrder[nextWorst]]...)
+				nextWorst++
 				continue
 			}
 			normalize(sums[j])
@@ -193,24 +295,6 @@ func FitClusterer(sample [][]string, opts ClusterPlanOptions) *ContentClusterer 
 		}
 	}
 	return c
-}
-
-// worstFit returns a copy of the sample vector least similar to its own nearest
-// centroid, the natural seed for a cluster that emptied out.
-func worstFit(vecs, centroids [][]float32) []float32 {
-	worst, worstDot := 0, float32(2)
-	for i, v := range vecs {
-		best := float32(-2)
-		for _, ce := range centroids {
-			if d := dot(v, ce); d > best {
-				best = d
-			}
-		}
-		if best < worstDot {
-			worst, worstDot = i, best
-		}
-	}
-	return append([]float32(nil), vecs[worst]...)
 }
 
 // SetCapacity fixes the per-shard capacity from the corpus size and resets the fill
@@ -226,6 +310,14 @@ func (c *ContentClusterer) SetCapacity(totalDocs int, slack float64) {
 // Shards is the number of clusters the plan assigns to.
 func (c *ContentClusterer) Shards() int { return len(c.centroids) }
 
+// Vector returns the feature-hash topic sketch for a token list, the vector Assign
+// scores against the centroids. Exposing it lets a parallel ingest compute the vectors
+// off the assignment path (the hashing is the per-document cost) and feed them to
+// AssignVec, which keeps only the fill-count mutation single-threaded.
+func (c *ContentClusterer) Vector(tokens []string) []float32 {
+	return featureVector(tokens, c.dims)
+}
+
 // Assign places a document in a shard by its nearest centroid, spilling to the
 // next-nearest with room when the nearest is at capacity, so the shard sizes stay
 // balanced. The spill trades a little topical purity for a hard size bound, the
@@ -234,13 +326,18 @@ func (c *ContentClusterer) Shards() int { return len(c.centroids) }
 // exact whatever it returns: the shard only decides which routing bound a document
 // contributes to, never whether it can be retrieved.
 func (c *ContentClusterer) Assign(tokens []string) int {
+	return c.AssignVec(featureVector(tokens, c.dims))
+}
+
+// AssignVec is Assign for a pre-computed feature vector (Vector), the split that lets
+// the vector hashing parallelize while the fill mutation stays single-threaded.
+func (c *ContentClusterer) AssignVec(v []float32) int {
 	if len(c.centroids) == 1 {
 		if c.fill != nil {
 			c.fill[0]++
 		}
 		return 0
 	}
-	v := featureVector(tokens, c.dims)
 
 	// Order shards by descending similarity, take the first with capacity. When no
 	// capacity is set every shard is open, so this is a plain nearest-centroid pick.
