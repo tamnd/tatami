@@ -94,10 +94,15 @@ func TestM5SearchSeededEqualsUnseeded(t *testing.T) {
 
 // TestM5ThresholdSharingLatency measures the payoff: it times each benchmark query
 // through the routed broker with the seed on and off, on the same warm cache, and
-// reports per-query p50/p99 for both plus the shard fan-out. Threshold sharing does
-// not change which shards the bound walk visits, so the fan-out is identical; the
-// win is lower per-shard WAND work, which shows up as lower p99. The seeded p99 is
-// the number the <10ms gate is held against.
+// reports per-query p50/p99 for both plus the shard fan-out. The parallel scheduler
+// prunes shards against the live global k-th while the fan-out is still running, so
+// the seed shows up twice: it makes each shard's WAND cheaper, and because a seeded
+// shard finishes sooner the shared k-th is published sooner, so the scheduler prunes
+// more of the in-flight claims. The fan-out is therefore a scheduler timing
+// observation, not a fixed set: seeding never increases it and usually shrinks it.
+// Exactness is proved separately (TestM5SeededEqualsUnseeded): the seed changes how
+// much work the fan-out does, never the result. The seeded p99 is the number the
+// <10ms gate is held against.
 func TestM5ThresholdSharingLatency(t *testing.T) {
 	c, _ := loadScaleCluster(t)
 	t.Logf("cluster: %d shards, %d live docs", c.NumShards(), c.NumDocs())
@@ -125,15 +130,15 @@ func TestM5ThresholdSharingLatency(t *testing.T) {
 	}
 
 	var seededAll, plainAll []time.Duration
+	var onVisTotal, offVisTotal int
 	for _, q := range benchQueries {
 		offP50, offP99, offVis, cand := bench(false, q)
 		onP50, onP99, onVis, _ := bench(true, q)
-		if onVis != offVis {
-			t.Errorf("query %q: seed changed fan-out %d -> %d, it must not", q, offVis, onVis)
-		}
-		t.Logf("%-26q seed-off p50=%-9v p99=%-9v | seed-on p50=%-9v p99=%-9v | shards %d/%d",
+		onVisTotal += onVis
+		offVisTotal += offVis
+		t.Logf("%-26q seed-off p50=%-9v p99=%-9v | seed-on p50=%-9v p99=%-9v | shards %d/%d (unseeded %d)",
 			q, offP50.Round(time.Microsecond), offP99.Round(time.Microsecond),
-			onP50.Round(time.Microsecond), onP99.Round(time.Microsecond), onVis, cand)
+			onP50.Round(time.Microsecond), onP99.Round(time.Microsecond), onVis, cand, offVis)
 
 		withSeed(c, true, func() {
 			for i := 0; i < reps; i++ {
@@ -155,9 +160,16 @@ func TestM5ThresholdSharingLatency(t *testing.T) {
 	sort.Slice(plainAll, func(i, j int) bool { return plainAll[i] < plainAll[j] })
 	seededP99 := seededAll[(len(seededAll)*99)/100]
 	plainP99 := plainAll[(len(plainAll)*99)/100]
-	t.Logf("overall seed-off p50=%v p99=%v | seed-on p50=%v p99=%v",
+	t.Logf("overall seed-off p50=%v p99=%v | seed-on p50=%v p99=%v | fan-out seeded %d vs unseeded %d",
 		plainAll[len(plainAll)/2].Round(time.Microsecond), plainP99.Round(time.Microsecond),
-		seededAll[len(seededAll)/2].Round(time.Microsecond), seededP99.Round(time.Microsecond))
+		seededAll[len(seededAll)/2].Round(time.Microsecond), seededP99.Round(time.Microsecond),
+		onVisTotal, offVisTotal)
+	// The seed can only tighten the shared k-th, so across the query set it must never
+	// drive the scheduler to visit more shards than the unseeded run. Per-query counts
+	// wobble with goroutine timing, so the guard is on the aggregate.
+	if onVisTotal > offVisTotal {
+		t.Errorf("seeded fan-out %d exceeds unseeded %d, a seed must not enlarge the visited set", onVisTotal, offVisTotal)
+	}
 	if seededP99 > 10*time.Millisecond {
 		t.Fatalf("seeded routed retrieval p99 %v exceeds the 10ms target", seededP99)
 	}

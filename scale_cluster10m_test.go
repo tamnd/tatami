@@ -502,8 +502,33 @@ func readBigramSidecar(path string) (search.BigramSource, error) {
 // fan-out: candidates is shards routed to, visited is shards actually opened after
 // the bound walk and threshold sharing pruned the rest.
 func TestClusterScale10M(t *testing.T) {
+	// This is the 10M sharded benchmark, and it only means something pointed at the
+	// 10M corpus or a segment set built from it, which takes minutes to build and
+	// hours to run through the whole 41GB. It must be opted into explicitly. Without
+	// TATAMI_SEG_DIR (reopen pre-built segments) or TATAMI_WET_DIR (build from the
+	// corpus) it skips, so a plain `go test ./...` on a dev box, whose default WET
+	// directory holds the smaller tier corpus, does not silently start a multi-minute
+	// build and trip the package timeout.
+	if os.Getenv("TATAMI_SEG_DIR") == "" && os.Getenv("TATAMI_WET_DIR") == "" {
+		t.Skip("set TATAMI_SEG_DIR (reopen segments) or TATAMI_WET_DIR (build corpus) to run the 10M benchmark")
+	}
+
+	// Give the Windows measurement box a 1ms scheduler tick so the tail reflects the
+	// engine rather than the default 15.6ms timer quantum (no-op off Windows).
+	raiseTimerResolution()
+
 	c, docs := buildShardedCorpus(t)
 	t.Logf("cluster: %d shards, %d docs", c.NumShards(), docs)
+
+	// Sweep the build's transient garbage once before the measured pass. The routing
+	// index is flat and pointer-free (a sorted term blob plus column arrays, not a
+	// map of pointers), so the collector traces a handful of slice headers and none
+	// of the tens of millions of terms inside them. That is what lets the GC run
+	// normally through the measured pass: a cycle costs almost nothing to scan, so it
+	// reclaims each query's top-k slices without the second-long pauses a pointer-rich
+	// routing map used to impose, and without needing to freeze the GC (which, frozen,
+	// let the measured pass accumulate query garbage until the box ran out of memory).
+	runtime.GC()
 
 	// Warm the routed shards into the open-segment cache so the measured pass
 	// reflects warm serving.
