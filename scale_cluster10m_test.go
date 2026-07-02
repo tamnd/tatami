@@ -49,6 +49,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/tamnd/tatami/search"
 )
 
@@ -490,19 +491,31 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 	tb.Logf("clustering: fit %d centroids over %d of %d docs, %v",
 		cl.Shards(), len(sample), total, nowMono().Sub(t0).Round(time.Second))
 
-	// Pass two: assign and spill. One gob writer per shard stays open, so a document
-	// from any crawl file streams straight into its shard's file with no buffering of
-	// the whole corpus. The spill carries the whole SearchDoc, since the shard build
-	// re-tokenizes it into the index and keeps a snippet.
-	spillPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("spill-%05d.gob", i)) }
+	// Pass two: assign and spill. One writer per shard stays open, so a document from
+	// any crawl file streams straight into its shard's file with no buffering of the
+	// whole corpus. The spill carries the whole SearchDoc, since the shard build
+	// re-tokenizes it into the index and keeps a snippet, so an uncompressed spill would
+	// put a second full copy of the corpus body on disk (about 10GB at 1M docs, and it is
+	// what filled the disk and stalled the clustered build at scale). The bodies are text
+	// and compress several-fold, so each spill is a zstd stream at the fastest level,
+	// with one goroutine per shard so the k open encoders do not oversubscribe the box.
+	// That drops the scratch high-water mark to a fraction of the raw body size, which is
+	// what lets a 10M or 100M clustered build run where a full-size spill would not fit.
+	spillPath := func(i int) string { return filepath.Join(tmp, fmt.Sprintf("spill-%05d.gob.zst", i)) }
 	files := make([]*os.File, k)
+	zws := make([]*zstd.Encoder, k)
 	encs := make([]*gob.Encoder, k)
 	for i := range files {
 		f, err := os.Create(spillPath(i))
 		if err != nil {
 			return nil, 0, fmt.Errorf("create spill %d: %w", i, err)
 		}
-		files[i], encs[i] = f, gob.NewEncoder(f)
+		zw, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+		if err != nil {
+			f.Close()
+			return nil, 0, fmt.Errorf("spill compressor %d: %w", i, err)
+		}
+		files[i], zws[i], encs[i] = f, zw, gob.NewEncoder(zw)
 	}
 	sizes := make([]int, k)
 	var spillErr error
@@ -556,7 +569,12 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 			}
 		}
 	}
+	// Flush each zstd stream before closing its file: the compressor buffers, so the
+	// spill's bytes are not all on disk until the encoder is closed.
 	for i := range files {
+		if cerr := zws[i].Close(); cerr != nil && spillErr == nil {
+			spillErr = cerr
+		}
 		if cerr := files[i].Close(); cerr != nil && spillErr == nil {
 			spillErr = cerr
 		}
@@ -588,18 +606,25 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 		if err != nil {
 			return fmt.Errorf("open spill %d: %w", i, err)
 		}
-		dec := gob.NewDecoder(f)
+		zr, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("open spill decompressor %d: %w", i, err)
+		}
+		dec := gob.NewDecoder(zr)
 		for {
 			var d SearchDoc
 			if derr := dec.Decode(&d); derr != nil {
 				if derr == io.EOF {
 					break
 				}
+				zr.Close()
 				f.Close()
 				return fmt.Errorf("spill decode shard %d: %w", i, derr)
 			}
 			b.Add(d)
 		}
+		zr.Close()
 		f.Close()
 		if err := writeSegmentAtomic(b, segPath(i)); err != nil {
 			return fmt.Errorf("write clustered segment %d: %w", i, err)
