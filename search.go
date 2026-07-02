@@ -113,6 +113,15 @@ type SearchBuilder struct {
 	// it, so a builder that never feeds a phrase router pays nothing (07-routing-latency.md,
 	// section 4.1).
 	bigrams map[search.BigramKey]*bigramStat
+	// bigramKeep, when non-nil, bounds the capture to these pairs. The phrase router
+	// only ever routes on a tracked set of adjacencies, never on every pair in the
+	// corpus (07-routing-latency.md, section 4.1 calls the full set an unbounded
+	// dictionary), so a builder handed that set records only those pairs and skips the
+	// rest at the source. That turns the shard-wide pair map from millions of entries
+	// over web text into the handful the router will ask for, which is the memory peak
+	// of a bigram-capturing build. A nil keep set (the default) captures every pair,
+	// the shape a caller that does not know its query set ahead of time still gets.
+	bigramKeep map[search.BigramKey]bool
 }
 
 // bigramStat is one shard's running count for an adjacent pair: how many documents
@@ -133,6 +142,14 @@ type SearchBuilderOptions struct {
 	// and capturing it costs a per-document pass over adjacent tokens and a shard-wide
 	// pair dictionary (07-routing-latency.md, section 4.1).
 	Bigrams bool
+	// BigramKeep bounds the capture to these pairs when non-nil. The sidecar the build
+	// writes only carries the pairs the query set routes on, so with the keep set in
+	// hand the builder records just those and never grows the shard-wide dictionary of
+	// every adjacency in the corpus. That dictionary, held resident per in-flight
+	// shard, is the memory peak of a sharded bigram build; bounding it at the source is
+	// what lets a 10M or 100M shard build fit a box with tens of GB. It takes effect
+	// only with Bigrams set; nil keeps the capture-everything behavior.
+	BigramKeep map[search.BigramKey]bool
 }
 
 // NewSearchBuilder returns an empty full-document builder, the shape that stores
@@ -155,6 +172,7 @@ func NewSearchBuilderWith(opts SearchBuilderOptions) *SearchBuilder {
 	}
 	if opts.Bigrams {
 		b.bigrams = map[search.BigramKey]*bigramStat{}
+		b.bigramKeep = opts.BigramKeep
 	}
 	return b
 }
@@ -182,7 +200,14 @@ func (b *SearchBuilder) Add(doc SearchDoc) {
 			n++
 			if docBigrams != nil {
 				if havePrev {
-					docBigrams[search.BigramKey{A: prev, B: tok}]++
+					key := search.BigramKey{A: prev, B: tok}
+					// With a keep set the builder tracks only the pairs the query set
+					// routes on, so an adjacency outside it never enters the per-document
+					// map or the shard dictionary. That is what keeps the pair map bounded
+					// to the query set instead of growing to every adjacency in the shard.
+					if b.bigramKeep == nil || b.bigramKeep[key] {
+						docBigrams[key]++
+					}
 				}
 				prev, havePrev = tok, true
 			}
