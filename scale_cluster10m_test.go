@@ -311,7 +311,7 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 						mu.Unlock()
 						continue
 					}
-					b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true})
+					b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true, BigramKeep: keep})
 					var err error
 					for _, f := range groups[i] {
 						if _, ferr := eachWETFile(f, math.MaxInt32, func(d SearchDoc) { b.Add(d) }); ferr != nil {
@@ -601,7 +601,7 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 		todo = append(todo, i)
 	}
 	buildOne := func(i int) error {
-		b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true})
+		b := NewSearchBuilderWith(SearchBuilderOptions{Snippet: true, Bigrams: true, BigramKeep: keep})
 		f, err := os.Open(spillPath(i))
 		if err != nil {
 			return fmt.Errorf("open spill %d: %w", i, err)
