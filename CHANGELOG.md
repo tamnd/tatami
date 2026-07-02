@@ -4,6 +4,71 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions track
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-02
+
+The scale release. tatami now builds and serves ten million documents on one box
+inside the ten millisecond goal, and the build survives an interruption. On the
+RTX 4090 box the sharded ten-million-document cluster answers at an overall p50
+of 1.08 ms and a p99 of 3.82 ms across a mixed keyword and phrase workload, with
+a peak of about 42 GiB inside a 56 GiB machine. Design in Spec 2066, the scale
+milestones.
+
+### Added
+
+- A block-tree term dictionary on disk and lazy posting decode. The term
+  dictionary is now a block tree read a block at a time instead of a flat table
+  held whole, so a segment opens without paging its entire vocabulary into
+  memory, and a posting list decodes only when the WAND loop reaches it rather
+  than all at once at open. This is what keeps the per-shard working set bounded
+  as the shard count climbs into the tens of thousands.
+- A streaming external-merge search writer. The scale tiers build a segment by
+  spilling sorted runs to disk and merging them, so a shard larger than memory
+  builds with a bounded footprint. The spill files are zstd-compressed, which
+  cuts the build's scratch space on the large tiers.
+- Content clustering into size-balanced topical shards. A build groups documents
+  by content into shards that are both balanced in size and coherent in topic, so
+  a phrase query touches a small candidate set of shards rather than fanning out
+  to all of them. Shards coarsen by a target shard count decoupled from the input
+  file count, so the same corpus lands on a fixed shard budget regardless of how
+  many Parquet files it arrived in.
+- Phrase routing on a fleet adjacency summary. Common phrases route to the boxes
+  that actually hold the adjacent terms, computed from an adjacency summary built
+  at index time, so a two-word phrase over a common word no longer fans out to
+  every box. The fleet fan-out is driven to just the candidate boxes, with
+  real-data latency gates guarding the routing decision.
+- An off-heap, mmap-aliasable routing index. The term-to-shard routing index is
+  now flat and pointer-free and persists to `routing.bin`, so it can be memory
+  mapped and shared rather than rebuilt on every open. `WriteRoutingFile` writes
+  it atomically through a temp file and rename, and the loader validates the magic,
+  version, endianness, and length so a torn file is rejected. This is lever three
+  of the scale plan: the routing index leaves the heap.
+- A resumable sharded build. A build that dies partway through resumes where it
+  stopped: a shard is skipped when both its `seg-NNNNN.tatami` segment and its
+  `seg-NNNNN.bgr` bigram sidecar are already on disk, and the routing index is
+  rebuilt from the segment dictionaries or loaded from a persisted `routing.bin`
+  when one is present. This helps the same way in two places, an idle-suspending
+  dev VM and a production crash, since either can now restart without redoing the
+  finished shards. The routing write is crash-safe and falls back to a rebuild if
+  the persisted file is unusable.
+- A worker-pool shard walk and a tunable cache cap. The shard walk fans out across
+  a worker pool instead of walking serially, and the clustered benchmark build is
+  parallelized, so a build uses the cores it is given. The segment cache cap is
+  tunable for memory-bound boxes, which is what lets the ten-million-document build
+  fit a 56 GiB machine.
+- The ten-million-document tiers and a sharded cluster benchmark. The multi-tier
+  real-data benchmark streams WET documents through tiers up to ten million
+  documents, and a sharded cluster benchmark builds and measures the ten-million
+  case end to end, with a persistent build-and-measure split so a built cluster can
+  be measured without re-reading the corpus.
+
+### Changed
+
+- Bounded bigram capture to the routed pair set. The build was holding a bigram
+  entry for every adjacent pair it saw, which is where the ten-million-document
+  build spent its memory. It now keeps only the bigrams that the phrase routing
+  can actually use, which is what brought the peak down to about 42 GiB and kept
+  the phrase latency inside the budget.
+
 ## [0.2.0] - 2026-06-27
 
 ### Added
