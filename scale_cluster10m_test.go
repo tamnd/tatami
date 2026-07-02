@@ -282,7 +282,7 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 		// time, then folds the routing and phrase sidecars exactly as the crawl-order
 		// tail does.
 		if clusterShards() > 0 {
-			c, docs, cerr := buildClusteredCorpus(tb, matches, tmp, keep)
+			c, docs, cerr := buildClusteredCorpus(tb, matches, tmp, !cleanup, keep)
 			if cleanup && cerr != nil {
 				_ = os.RemoveAll(tmp)
 			}
@@ -372,7 +372,12 @@ func buildShardedCorpus(tb testing.TB) (*Cluster, int) {
 			paths[i] = segPath(i)
 		}
 		cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
-		c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
+		// Resume the routing index too, not only the segments. Rebuilding the routing
+		// from every shard dictionary is the tens-of-gigabytes step of a large build,
+		// so a run killed after the shards were written should not pay it twice: when
+		// the segments live in a persistent directory the first build writes routing.bin
+		// beside them and every later run mmaps it and skips the rebuild.
+		c, err := openClusterResumable(paths, tmp, !cleanup, cache)
 		if err != nil {
 			shardedErr = err
 			return
@@ -443,7 +448,7 @@ func parseFilesParallel(matches []string, workers int, fn func(fi int, f string)
 // index and phrase sidecars fold exactly as the crawl-order build's tail does, and
 // the segments are written with the same seg-NNNNN names so a later measure-only
 // reopen cannot tell a clustered corpus from a crawl-order one.
-func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[search.BigramKey]bool) (*Cluster, int, error) {
+func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, persist bool, keep map[search.BigramKey]bool) (*Cluster, int, error) {
 	k := clusterShards()
 	t0 := nowMono()
 
@@ -670,9 +675,11 @@ func buildClusteredCorpus(tb testing.TB, matches []string, tmp string, keep map[
 	}
 
 	// Shared tail: build the routing index over the clustered shards and fold their
-	// phrase sidecars, the same broker the crawl-order build returns.
+	// phrase sidecars, the same broker the crawl-order build returns. The routing is
+	// resumed from routing.bin when the shards live in a persistent directory, so a
+	// killed clustered build finishes without paying the routing rebuild again.
 	cache := envInt("TATAMI_CACHE_SHARDS", len(paths))
-	c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
+	c, err := openClusterResumable(paths, tmp, persist, cache)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -731,18 +738,7 @@ func reopenSegmentCluster(segDir string) (*Cluster, int, error) {
 	// to the segments, mmap it and skip the rebuild, so the reopen box pays the file,
 	// not the tens-of-gigabytes routing rebuild. The first reopen has no file, so it
 	// rebuilds once and writes routing.bin for every reopen after.
-	rpath := filepath.Join(segDir, "routing.bin")
-	var c *Cluster
-	if fileExists(rpath) {
-		c, err = OpenClusterWithRoutingFile(paths, rpath, ClusterOptions{CacheSize: cache})
-	} else {
-		c, err = OpenCluster(paths, ClusterOptions{CacheSize: cache})
-		if err == nil {
-			if werr := c.PersistRouting(rpath); werr != nil {
-				return nil, 0, fmt.Errorf("persist routing.bin: %w", werr)
-			}
-		}
-	}
+	c, err := openClusterResumable(paths, segDir, true, cache)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -755,6 +751,41 @@ func reopenSegmentCluster(segDir string) (*Cluster, int, error) {
 		bb.AddShard(uint32(i), src)
 	}
 	return c.WithBigramRouting(bb.Build()), c.NumDocs(), nil
+}
+
+// openClusterResumable opens a broker over the segment paths, resuming the routing
+// index from a routing.bin beside them when one is present. Rebuilding the routing
+// from every shard dictionary is the tens-of-gigabytes step of a large build, so
+// persisting it once and mmapping it after is what makes an interrupted build cheap
+// to finish and a crashed server fast to bring back: the shards resume from their
+// segments, the routing resumes from its file. The first build over a directory has
+// no file, so it rebuilds once and writes routing.bin for every run after. When
+// persist is false (an ephemeral temp dir that gets removed) it just rebuilds, since
+// there is nothing to resume into.
+func openClusterResumable(paths []string, dir string, persist bool, cache int) (*Cluster, error) {
+	if !persist {
+		return OpenCluster(paths, ClusterOptions{CacheSize: cache})
+	}
+	rpath := filepath.Join(dir, "routing.bin")
+	if fileExists(rpath) {
+		c, err := OpenClusterWithRoutingFile(paths, rpath, ClusterOptions{CacheSize: cache})
+		if err == nil {
+			return c, nil
+		}
+		// A routing.bin that will not load (a stale layout, a partial copy between
+		// boxes, a file written by another build) should not wedge the resume: drop
+		// it and rebuild from the shard dictionaries, which are the source of truth.
+		fmt.Fprintf(os.Stderr, "routing.bin at %s unusable (%v); rebuilding\n", rpath, err)
+		_ = os.Remove(rpath)
+	}
+	c, err := OpenCluster(paths, ClusterOptions{CacheSize: cache})
+	if err != nil {
+		return nil, err
+	}
+	if werr := c.PersistRouting(rpath); werr != nil {
+		return nil, fmt.Errorf("persist routing.bin: %w", werr)
+	}
+	return c, nil
 }
 
 // fileExists reports whether path is a present, non-empty regular file.

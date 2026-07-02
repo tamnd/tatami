@@ -114,17 +114,35 @@ func bytesOf[T any](s []T) []byte {
 // routing.bin. It is meant to run once as the last step of the build pipeline,
 // on the machine that already holds the corpus, so the serving box never pays the
 // rebuild.
+// WriteRoutingFile writes ri to path atomically: it writes a sibling temp file,
+// fsyncs it, and renames it over path, so a reader (or a resuming build) only ever
+// sees a complete file. A crash mid-write leaves the temp file, not a truncated
+// routing.bin, so the next start rebuilds the index rather than mmapping a partial
+// one. This is what makes the persisted routing safe to resume from in production,
+// where the writer can die at any point.
 func WriteRoutingFile(path string, ri *RoutingIndex) error {
-	f, err := os.Create(path)
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	if err := writeRoutingTo(f, ri); err != nil {
 		f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("search: sync routing file: %w", err)
+	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("search: close routing file: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("search: rename routing file into place: %w", err)
 	}
 	return nil
 }
