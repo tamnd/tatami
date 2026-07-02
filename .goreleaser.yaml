@@ -29,11 +29,14 @@ builds:
       - -X github.com/tamnd/tatami/cli.Commit={{ .ShortCommit }}
       - -X github.com/tamnd/tatami/cli.Date={{ .CommitDate }}
     mod_timestamp: "{{ .CommitTimestamp }}"
+    # 64-bit only. The routing.bin off-heap format aliases a mapped int64 column
+    # back as a []int with no copy, so search/routing_file.go carries a compile
+    # guard that fails on a 32-bit build rather than mis-aliasing at runtime. That
+    # rules out linux_386 and linux_arm_7, which is fine: tatami is a data engine
+    # for 64-bit servers.
     targets:
       - linux_amd64
       - linux_arm64
-      - linux_arm_7
-      - linux_386
       - darwin_amd64
       - darwin_arm64
       - windows_amd64
